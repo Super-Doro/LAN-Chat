@@ -1351,6 +1351,37 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       box-shadow:0 12px 30px rgba(39,62,88,.13),0 0 0 3px rgba(10,132,255,.08),inset 0 1px 1px #fff;
     }
   </style>
+  <style id="nickname-avatar-system">
+    .avatar-initial {
+      --avatar-from:#4ca4ff;
+      --avatar-to:#0a74e8;
+      color:#fff!important;
+      border-color:rgba(255,255,255,.88)!important;
+      background:linear-gradient(145deg,var(--avatar-from),var(--avatar-to))!important;
+      box-shadow:0 6px 16px rgba(40,78,116,.18),inset 0 1px 1px rgba(255,255,255,.42)!important;
+      font-family:var(--font);
+      font-weight:750;
+      line-height:1;
+      text-transform:uppercase;
+      user-select:none;
+    }
+    .avatar-initial[data-avatar-tone="1"] { --avatar-from:#a287ff; --avatar-to:#7251db; }
+    .avatar-initial[data-avatar-tone="2"] { --avatar-from:#3bcdb7; --avatar-to:#078c7e; }
+    .avatar-initial[data-avatar-tone="3"] { --avatar-from:#ffb364; --avatar-to:#df7428; }
+    .avatar-initial[data-avatar-tone="4"] { --avatar-from:#ff819f; --avatar-to:#d94b70; }
+    .avatar-initial[data-avatar-tone="5"] { --avatar-from:#7894ff; --avatar-to:#4059c9; }
+    .avatar.avatar-initial { font-size:18px; }
+    .user-row-avatar.avatar-initial {
+      width:24px;
+      height:24px;
+      border:1px solid rgba(255,255,255,.88);
+      border-radius:9px;
+      display:grid;
+      place-items:center;
+      font-size:11px;
+    }
+    .message-avatar.avatar-initial { font-size:13px; }
+  </style>
 </head>
 <body>
   <svg width="0" height="0" aria-hidden="true" style="position:absolute;overflow:hidden">
@@ -1428,6 +1459,32 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       target.replaceChildren(iconNode(safe));
       target.dataset.icon=safe;
     }
+    const avatarSegmenter=typeof Intl.Segmenter==='function'?new Intl.Segmenter('zh-CN',{granularity:'grapheme'}):null;
+    function avatarInitial(name) {
+      const value=String(name||'').trim();
+      if(!value) return '匿';
+      if(avatarSegmenter) return avatarSegmenter.segment(value)[Symbol.iterator]().next().value?.segment||'匿';
+      return Array.from(value)[0]||'匿';
+    }
+    function avatarTone(name) {
+      let hash=2166136261;
+      for(const character of String(name||'')) {
+        hash^=character.codePointAt(0);
+        hash=Math.imul(hash,16777619)>>>0;
+      }
+      return hash%6;
+    }
+    function setAvatarInitial(target,name) {
+      const value=String(name||'').trim()||'匿名';
+      const initial=avatarInitial(value).toLocaleUpperCase('zh-CN');
+      const tone=String(avatarTone(value));
+      if(target.dataset.avatarInitial!==initial) target.textContent=initial;
+      target.classList.add('avatar-initial');
+      target.dataset.avatarInitial=initial;
+      target.dataset.avatarTone=tone;
+      delete target.dataset.icon;
+      target.setAttribute('aria-hidden','true');
+    }
     function setText(target,value) {
       const text=String(value);
       if(target.textContent!==text) target.textContent=text;
@@ -1476,7 +1533,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     previousEmojiPage.addEventListener('click',()=>{ if(emojiPage>0){ emojiPage--; renderEmojiPage(); } });
     nextEmojiPage.addEventListener('click',()=>{ if(emojiPage<Math.ceil(emojis.length/emojiPageSize)-1){ emojiPage++; renderEmojiPage(); } });
     renderEmojiPage();
-    $('my-name').value = identity.name; setIcon($('my-avatar'),identity.avatar);
+    $('my-name').value = identity.name; setAvatarInitial($('my-avatar'),identity.name);
     const apiBase = location.protocol === 'file:' ? 'http://localhost:9000' : '';
     const DEFAULT_ROW = 80;
     const ROW_GAP = 16;
@@ -1559,7 +1616,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       row.dataset.at = String(m.at);
       row.dataset.expiresAt = String(m.at + state.retentionMs);
       row.innerHTML = '<div class="message-avatar"></div><div class="message-meta"><div class="message-name"></div><div class="message-tag" hidden></div></div><div class="message-bubble"><span class="message-text"></span><div class="message-file" hidden><div class="file-name"></div><div class="file-meta"></div><a class="file-download"></a></div><div class="message-footer"><button class="message-action copy-action" type="button" title="复制消息" aria-label="复制消息"></button><time class="message-time"></time><button class="message-action recall-action" type="button" title="撤回消息" aria-label="撤回消息"></button></div></div>';
-      setIcon(row.querySelector('.message-avatar'),m.avatar);
+      setAvatarInitial(row.querySelector('.message-avatar'),m.name);
       row.querySelector('.message-name').textContent = m.name;
       const textNode=row.querySelector('.message-text');
       textNode.textContent = m.recalled ? '该消息已撤回' : m.text;
@@ -1752,7 +1809,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       filtered.forEach(user=>{
         const entry=document.createElement('div'); entry.className='user-entry';
         const button=document.createElement('button'); button.type='button'; button.className='user-row'+(user.id===identity.id?' self':'')+(state.mode==='private'&&state.peer?.id===user.id?' active':'');
-        const avatar=document.createElement('span'); avatar.className='user-row-avatar'; setIcon(avatar,user.avatar);
+        const avatar=document.createElement('span'); avatar.className='user-row-avatar'; setAvatarInitial(avatar,user.name);
         const name=document.createElement('span'); name.className='user-row-name'; name.textContent=user.name+(user.id===identity.id?'（我）':'');
         const channel=document.createElement('span'); channel.className='user-row-channel';
         const channelInfo=state.channels.find(item=>item.id===user.channel); channel.textContent=channelInfo?channelInfo.name:user.channel;
@@ -1988,6 +2045,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         if(!state.nameEdited && data.assignedName) {
           identity.name=data.assignedName;
           $('my-name').value=data.assignedName;
+          setAvatarInitial($('my-avatar'),identity.name);
         }
         if(typeof data.renderBatch === 'number') state.renderBatch = data.renderBatch;
         if(typeof data.pollInterval === 'number') state.pollInterval = data.pollInterval;
@@ -2048,7 +2106,12 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         render();
       });
     },{passive:true});
-    $('my-name').addEventListener('input', e => { state.nameEdited=true; identity.name=Array.from(e.target.value).slice(0,5).join(''); e.target.value=identity.name; });
+    $('my-name').addEventListener('input', e => {
+      state.nameEdited=true;
+      identity.name=Array.from(e.target.value).slice(0,5).join('');
+      e.target.value=identity.name;
+      setAvatarInitial($('my-avatar'),identity.name);
+    });
     $('mobile-users-toggle').addEventListener('click',()=>setMobileUsersOpen(true));
     $('mobile-users-close').addEventListener('click',()=>setMobileUsersOpen(false));
     document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&document.body.classList.contains('mobile-users-open')) setMobileUsersOpen(false); });
@@ -2122,7 +2185,11 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         }
         if(response.status === 429) { state.full = true; state.blockedReason=data.error||'room full'; updateBlocker(true, state.blockRetry,state.blockedReason); throw Error('full'); }
         if(!response.ok) throw Error(data.error||'send failed');
-        if(data.name && data.name!==identity.name) { identity.name=data.name; $('my-name').value=data.name; }
+        if(data.name && data.name!==identity.name) {
+          identity.name=data.name;
+          $('my-name').value=data.name;
+          setAvatarInitial($('my-avatar'),identity.name);
+        }
         input.value='';
         state.scrollLocked = true;
       } catch(err) {
