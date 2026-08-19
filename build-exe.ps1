@@ -12,6 +12,11 @@ $outputName = if ($env:VOID_CHAT_EXE_NAME) { $env:VOID_CHAT_EXE_NAME } else { 'V
 if ($outputName -notmatch '^[A-Za-z0-9._-]+\.exe$') {
   throw 'VOID_CHAT_EXE_NAME must be a safe .exe file name.'
 }
+$buildDir = Join-Path $projectRoot 'build'
+$distDir = Join-Path $projectRoot 'dist'
+$outputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($outputName)
+$rawOutputPath = Join-Path $buildDir ($outputBaseName + '.raw.exe')
+$outputPath = Join-Path $distDir $outputName
 
 $nvmRoot = 'D:\NVM Desktop\files'
 if (Test-Path -LiteralPath $nvmRoot) {
@@ -50,6 +55,11 @@ if (-not $nodePath) {
 Write-Host "Build runtime: $nodePath"
 & $nodePath (Join-Path $projectRoot 'tools\build-exe.js')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not (Test-Path -LiteralPath $rawOutputPath)) {
+  throw "Raw SEA output was not generated: $rawOutputPath"
+}
+
+New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 if (-not $SkipCompression) {
   $upxVersion = '5.2.0'
@@ -77,11 +87,12 @@ if (-not $SkipCompression) {
     throw "UPX executable was not found after extraction: $upxPath"
   }
 
-  $outputPath = Join-Path (Join-Path $projectRoot 'dist') $outputName
-  $sizeBefore = (Get-Item -LiteralPath $outputPath).Length
-  $compressedName = ([System.IO.Path]::GetFileNameWithoutExtension($outputName)) + '.compressed.exe'
-  $compressedPath = Join-Path (Join-Path $projectRoot 'build') $compressedName
-  Copy-Item -LiteralPath $outputPath -Destination $compressedPath -Force
+  $sizeBefore = (Get-Item -LiteralPath $rawOutputPath).Length
+  $compressedPath = Join-Path $buildDir ($outputBaseName + '.compressed.exe')
+  if (Test-Path -LiteralPath $compressedPath) {
+    Remove-Item -LiteralPath $compressedPath -Force
+  }
+  Copy-Item -LiteralPath $rawOutputPath -Destination $compressedPath
   Write-Host "Compressing executable with UPX v$upxVersion..."
   try {
     & $upxPath --best --lzma --no-progress $compressedPath
@@ -98,6 +109,10 @@ if (-not $SkipCompression) {
   $sizeAfter = (Get-Item -LiteralPath $outputPath).Length
   $savedPercent = [math]::Round((1 - ($sizeAfter / $sizeBefore)) * 100, 1)
   Write-Host ("Final size: {0:N1} MB (reduced by {1}%)" -f ($sizeAfter / 1MB), $savedPercent)
+} else {
+  Copy-Item -LiteralPath $rawOutputPath -Destination $outputPath -Force
+  $sizeAfter = (Get-Item -LiteralPath $outputPath).Length
+  Write-Host ("Final size: {0:N1} MB (compression skipped)" -f ($sizeAfter / 1MB))
 }
 
 Write-Host ''

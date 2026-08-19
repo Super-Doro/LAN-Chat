@@ -6,6 +6,8 @@
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
 ```
 
+不要直接运行 `node .\tools\build-exe.js`，它只负责生成约 `94 MB` 的原始 SEA。请等待 PowerShell 输出 `Final size` 和 `Done`，之后 `dist\VOID-Chat.exe` 才是约 `23 MB` 的最终压缩版。
+
 构建成功后会生成：
 
 ```text
@@ -16,7 +18,7 @@ dist\VOID-Chat.exe
 
 最终用户只需要这个 EXE 文件，不需要安装 Node.js、npm 或其他运行环境。
 
-构建脚本默认使用经过 SHA-256 校验的官方 UPX 压缩完整 Node.js 运行时，并在完成后执行 UPX 完整性测试。若需要生成未压缩的原始 SEA 文件，请执行：
+构建脚本默认使用经过 SHA-256 校验的官方 UPX 压缩完整 Node.js 运行时，并在完成后执行 UPX 完整性测试。原始 SEA 只保存在 `build` 临时目录，压缩通过后才会更新 `dist`。若需要生成未压缩的原始 SEA 文件，请执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1 -SkipCompression

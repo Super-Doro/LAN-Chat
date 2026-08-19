@@ -82,7 +82,7 @@ VOID-Chat.exe
 
 ```text
 VOID chat running on http://localhost:9000
-LAN access: http://192.168.1.10:9000
+LAN access: http://192.168.98.5:9000
 ```
 
 - 服务器本机使用浏览器打开 `http://localhost:9000`。
@@ -154,6 +154,8 @@ $env:ADMIN_PASSWORD = "请设置一个强密码"
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
 ```
 
+必须运行上面的 PowerShell 入口，不要直接执行 `node .\tools\build-exe.js`。控制台显示约 `94 MB` 时只是原始 Node SEA，继续等待出现 `Final size` 和 `Done`；此时 `dist\VOID-Chat.exe` 才是约 `23 MB` 的最终压缩版。
+
 构建成功后生成：
 
 ```text
@@ -162,7 +164,7 @@ dist\VOID-Chat.exe
 
 当前 Windows x64 构建实测由约 `93.8 MB` 压缩到约 `23.2 MB`，具体体积会随 Node.js 和 UPX 版本变化。
 
-构建脚本会优先查找本机可用的 Node.js 26+。如果没有找到，会将便携版 Node.js 下载到项目的 `.build-tools` 目录。脚本还会下载官方 UPX 5.2.0，校验 SHA-256 后压缩最终 EXE，并对压缩结果执行完整性测试。
+构建脚本会优先查找本机可用的 Node.js 26+。如果没有找到，会将便携版 Node.js 下载到项目的 `.build-tools` 目录。脚本还会下载官方 UPX 5.2.0，校验 SHA-256 后压缩最终 EXE，并对压缩结果执行完整性测试。未压缩的原始 SEA 只保存在 `build` 临时目录，只有压缩成功后才会更新 `dist` 中的最终文件。
 
 如果需要未经 UPX 压缩的原始 SEA 文件，可以运行：
 
