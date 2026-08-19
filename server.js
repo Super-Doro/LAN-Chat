@@ -22,12 +22,17 @@ const PAGE = (() => {
   }
   return source.slice(startIndex + '/* PAGE_START'.length, endIndex).trimStart();
 })();
-const RETENTION_MS = 5 * 60 * 1000;
+const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
+const MIN_RETENTION_MINUTES = 1;
+const MAX_RETENTION_MINUTES = 24 * 60;
 const MAX_MESSAGES = 1000;
 const MAX_CONNECTIONS = 100;
 const ACTIVE_WINDOW_MS = 6000;
 const MAX_BODY_BYTES = 16 * 1024;
-const MAX_FILE_BYTES = 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 1024 * 1024;
+const MIN_FILE_MEGABYTES = 1;
+const MAX_FILE_MEGABYTES = 20 * 1024;
+const MAX_UPLOAD_DURATION_MS = 12 * 60 * 60 * 1000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '666666';
 const RENDER_BATCH = 100;
 const POLL_HINT = 1500;
@@ -39,8 +44,8 @@ const RECALL_WINDOW_MS = 3 * 60 * 1000;
 const FILE_DIR = path.join(os.tmpdir(), 'void-chat-files');
 fs.mkdirSync(FILE_DIR,{recursive:true});
 const channels = [
-  { id: 'channel1', name: '唠嗑' },
-  { id: 'channel2', name: '吐槽' },
+  { id: 'channel1', name: '频道1' },
+  { id: 'channel2', name: '频道2' },
   { id: 'channel3', name: '频道3' },
   { id: 'channel4', name: '频道4' },
   { id: 'channel5', name: '频道5' }
@@ -52,6 +57,9 @@ const reservedNames = new Map();
 const adminTokens = new Map();
 const bannedIps = new Map();
 const ownedFileIds = new Set();
+const activeUploadIds = new Set();
+let retentionMs = DEFAULT_RETENTION_MS;
+let maxFileBytes = DEFAULT_MAX_FILE_BYTES;
 const localAddresses = new Set(['127.0.0.1','::1',...Object.values(os.networkInterfaces()).flat().filter(Boolean).map(item=>item.address)]);
 const avatarIcons = new Set(['orbit','radio','circle-dot-dashed','triangle','hexagon','asterisk','scan-line','waves','box']);
 function safeAvatar(raw) { const value=String(raw||''); return avatarIcons.has(value)?value:'orbit'; }
@@ -91,11 +99,11 @@ function filePath(fileId) { return path.join(FILE_DIR, fileId); }
 function forgetFile(fileId) { ownedFileIds.delete(fileId); return fs.promises.rm(filePath(fileId),{force:true}).catch(()=>{}); }
 function deleteMessageFile(message) { if(message?.file?.id) forgetFile(message.file.id); }
 function cleanExpiredFilesOnDisk(now=Date.now()) {
-  fs.readdir(FILE_DIR,{withFileTypes:true},(error,entries)=>{ if(error) return; entries.filter(entry=>entry.isFile()).forEach(entry=>{ const target=path.join(FILE_DIR,entry.name); fs.stat(target,(statError,stat)=>{ if(!statError&&now-stat.mtimeMs>=RETENTION_MS) fs.rm(target,{force:true},()=>{}); }); }); });
+  fs.readdir(FILE_DIR,{withFileTypes:true},(error,entries)=>{ if(error) return; entries.filter(entry=>entry.isFile()&&!activeUploadIds.has(entry.name)).forEach(entry=>{ const target=path.join(FILE_DIR,entry.name); fs.stat(target,(statError,stat)=>{ if(!statError&&now-stat.mtimeMs>=retentionMs) fs.rm(target,{force:true},()=>{}); }); }); });
 }
 function keepFreshMessages(items,cutoff) { return items.filter(message=>{ if(message.at>cutoff) return true; deleteMessageFile(message); return false; }); }
 function pruneMessages(now=Date.now()) {
-  const cutoff=now-RETENTION_MS;
+  const cutoff=now-retentionMs;
   for(const [channelId,channelMessages] of messages) messages.set(channelId,keepFreshMessages(channelMessages,cutoff));
   for(const [key,thread] of privateMessages) { const active=keepFreshMessages(thread,cutoff); if(active.length) privateMessages.set(key,active); else privateMessages.delete(key); }
 }
@@ -135,20 +143,22 @@ async function receiveFile(req,res,url) {
   const name=safeFileName(req.headers['x-file-name']);
   if(!name) { req.resume(); return json(res,400,{error:'invalid file name'}); }
   const declaredSize=Number(req.headers['content-length']);
-  if(Number.isFinite(declaredSize)&&(declaredSize<=0||declaredSize>MAX_FILE_BYTES)) { req.resume(); return json(res,413,{error:'file too large',limit:MAX_FILE_BYTES}); }
+  if(Number.isFinite(declaredSize)&&(declaredSize<=0||declaredSize>maxFileBytes)) { req.resume(); return json(res,413,{error:'file too large',limit:maxFileBytes}); }
   const slot=reserveSendSlot(sender,now);
   if(slot.retryAfter) { req.resume(); return json(res,429,{error:'rate limit',retryAfter:slot.retryAfter}); }
   clients.set(clientId,{...sender,lastSeen:now,sentAt:slot.sentAt});
   const fileId=crypto.randomUUID(); const downloadToken=crypto.randomBytes(24).toString('hex');
-  const target=filePath(fileId); let size=0; ownedFileIds.add(fileId);
-  const limiter=new Transform({transform(chunk,encoding,callback) { size+=chunk.length; if(size>MAX_FILE_BYTES) { const error=new Error('file too large'); error.code='FILE_TOO_LARGE'; callback(error); } else callback(null,chunk); }});
+  const target=filePath(fileId); let size=0; ownedFileIds.add(fileId); activeUploadIds.add(fileId);
+  const limiter=new Transform({transform(chunk,encoding,callback) { size+=chunk.length; if(size>maxFileBytes) { const error=new Error('file too large'); error.code='FILE_TOO_LARGE'; callback(error); } else callback(null,chunk); }});
   try {
     await pipeline(req,limiter,fs.createWriteStream(target,{flags:'wx'}));
   } catch(error) {
+    activeUploadIds.delete(fileId);
     await forgetFile(fileId);
-    if(!res.headersSent) return json(res,error.code==='FILE_TOO_LARGE'?413:400,{error:error.code==='FILE_TOO_LARGE'?'file too large':'upload failed',limit:MAX_FILE_BYTES});
+    if(!res.headersSent) return json(res,error.code==='FILE_TOO_LARGE'?413:400,{error:error.code==='FILE_TOO_LARGE'?'file too large':'upload failed',limit:maxFileBytes});
     return;
   }
+  activeUploadIds.delete(fileId);
   if(!size) { await forgetFile(fileId); return json(res,400,{error:'empty file'}); }
   const completedAt=Date.now(); pruneClients(completedAt);
   if(peerId&&!clients.has(peerId)) { await forgetFile(fileId); return json(res,404,{error:'peer offline'}); }
@@ -168,7 +178,7 @@ async function sendFile(req,res,url) {
   const fileId=match[1]; const clientId=String(url.searchParams.get('client')||''); const token=String(url.searchParams.get('token')||'');
   const now=Date.now(); const ip=requestIp(req); pruneClients(now); pruneMessages(now);
   const connected=clients.get(clientId); const message=findFileMessage(fileId);
-  if(!connected||connected.ip!==ip||!message||message.recalled||now-message.at>=RETENTION_MS) { json(res,404,{error:'file unavailable'}); return true; }
+  if(!connected||connected.ip!==ip||!message||message.recalled||now-message.at>=retentionMs) { json(res,404,{error:'file unavailable'}); return true; }
   const canDownload=message.mode==='private'?(clientId===message.senderId||clientId===message.recipientId):connected.channel===message.channel;
   if(!canDownload) { json(res,403,{error:'file access denied'}); return true; }
   if(!message.file||token!==message.file.token) { json(res,403,{error:'invalid file token'}); return true; }
@@ -180,9 +190,25 @@ async function sendFile(req,res,url) {
 }
 function serve(req,res) {
   const url = new URL(req.url, 'http://localhost');
-  if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{canAdmin:isLocalRequest(req),limit:MAX_CONNECTIONS,maxFileBytes:MAX_FILE_BYTES});
+  if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{canAdmin:isLocalRequest(req),limit:MAX_CONNECTIONS,retentionMs,maxFileBytes});
   if (req.method==='POST' && url.pathname==='/api/admin/login') return body(req).then(data => { if(!isLocalRequest(req)) return json(res,403,{error:'local only'}); if(String(data.password||'')!==ADMIN_PASSWORD) return json(res,401,{error:'wrong password'}); const token=crypto.randomBytes(24).toString('hex'); adminTokens.set(token,{ip:requestIp(req),expiresAt:Date.now()+60*60*1000}); json(res,200,{token}); }).catch(error=>json(res,error.message==='body too large'?413:400,{error:error.message==='body too large'?'body too large':'invalid'}));
   if (req.method==='POST' && url.pathname==='/api/admin/channel') return body(req).then(data => { if(!getAdmin(req)) return json(res,403,{error:'admin required'}); const channel=channels.find(item=>item.id===data.id); const name=Array.from(String(data.name||'').trim()).slice(0,10).join(''); if(!channel||!name) return json(res,400,{error:'invalid channel'}); channel.name=name; json(res,200,{channels}); }).catch(()=>json(res,400,{error:'invalid'}));
+  if (req.method==='POST' && url.pathname==='/api/admin/settings') return body(req).then(data => {
+    if(!getAdmin(req)) return json(res,403,{error:'admin required'});
+    const retentionValue=String(data.retentionMinutes??'');
+    const fileSizeValue=String(data.fileMegabytes??'');
+    const digitsOnly=/^[0-9]+$/;
+    const retentionMinutes=Number(retentionValue);
+    const fileMegabytes=Number(fileSizeValue);
+    const validRetention=digitsOnly.test(retentionValue)&&Number.isInteger(retentionMinutes)&&retentionMinutes>=MIN_RETENTION_MINUTES&&retentionMinutes<=MAX_RETENTION_MINUTES;
+    const validFileSize=digitsOnly.test(fileSizeValue)&&Number.isInteger(fileMegabytes)&&fileMegabytes>=MIN_FILE_MEGABYTES&&fileMegabytes<=MAX_FILE_MEGABYTES;
+    if(!validRetention||!validFileSize) return json(res,400,{error:'invalid settings'});
+    retentionMs=retentionMinutes*60*1000;
+    maxFileBytes=fileMegabytes*1024*1024;
+    pruneMessages();
+    cleanExpiredFilesOnDisk();
+    json(res,200,{ok:true,retentionMs,maxFileBytes});
+  }).catch(error=>json(res,error.message==='body too large'?413:400,{error:error.message==='body too large'?'body too large':'invalid'}));
   if (req.method==='GET' && url.pathname==='/api/admin/user') { if(!getAdmin(req)) return json(res,403,{error:'admin required'}); const clientId=String(url.searchParams.get('client')||''); const client=clients.get(clientId); if(!client) return json(res,404,{error:'offline'}); return json(res,200,{id:clientId,name:reservedNames.get(clientId)||'匿名用户',ip:client.ip,channel:client.channel,lastSeen:client.lastSeen,banned:isIpBanned(client.ip)}); }
   if (req.method==='GET' && url.pathname==='/api/admin/bans') { if(!getAdmin(req)) return json(res,403,{error:'admin required'}); return json(res,200,{bans:banList()}); }
   if (req.method==='POST' && url.pathname==='/api/admin/ban') return body(req).then(data => {
@@ -224,7 +250,7 @@ function serve(req,res) {
       const peerRecord=clients.get(peer);
       peerInfo={id:peer,name:reservedNames.get(peer)||peerRecord?.name||'已离线用户',avatar:safeAvatar(peerRecord?.avatar),online:!!peerRecord};
     }
-    return json(res,200,{cursor,messages:activeMessages.filter(m=>m.cursor>since),mode:peer?'private':'channel',peer:peerInfo,privateUnread:privateUnreadFor(client),privateActivity:privateActivityFor(client),online:clients.size,onlineByChannel:onlineByChannel(now),users:onlineUsers(now),channels,retentionMs:RETENTION_MS,recallWindowMs:RECALL_WINDOW_MS,maxFileBytes:MAX_FILE_BYTES,assignedName,limit:MAX_CONNECTIONS,renderBatch:RENDER_BATCH,pollInterval:POLL_HINT});
+    return json(res,200,{cursor,messages:activeMessages.filter(m=>m.cursor>since),mode:peer?'private':'channel',peer:peerInfo,privateUnread:privateUnreadFor(client),privateActivity:privateActivityFor(client),online:clients.size,onlineByChannel:onlineByChannel(now),users:onlineUsers(now),channels,retentionMs,recallWindowMs:RECALL_WINDOW_MS,maxFileBytes,assignedName,limit:MAX_CONNECTIONS,renderBatch:RENDER_BATCH,pollInterval:POLL_HINT});
   }
   if (req.method==='POST' && url.pathname==='/api/message') return body(req).then(data => {
     if(typeof data.text!=='string'||!data.text.trim()) return json(res,400,{error:'empty'});
@@ -274,7 +300,9 @@ process.once('exit',()=>{ for(const fileId of ownedFileIds) { try { fs.rmSync(fi
 process.once('SIGINT',()=>process.exit(0));
 process.once('SIGTERM',()=>process.exit(0));
 const localIPv4Addresses = [...new Set(Object.values(os.networkInterfaces()).flat().filter(item => item && !item.internal && (item.family === 'IPv4' || item.family === 4)).map(item => item.address))];
-http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
+const server=http.createServer(serve);
+server.requestTimeout=MAX_UPLOAD_DURATION_MS;
+server.listen(PORT,'0.0.0.0',()=>{
   console.log(`VOID chat running on http://localhost:${PORT}`);
   localIPv4Addresses.forEach(address => console.log(`LAN access: http://${address}:${PORT}`));
 });
@@ -343,7 +371,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .message-avatar { grid-area:avatar; width:38px; height:38px; display:grid; place-items:center; border:1px solid var(--line); background:#e7eee1; font-size:18px; user-select:none; border-radius:10px; }
     .message-meta { grid-area:meta; display:flex; align-items:baseline; gap:10px; }
     .message-name { font:700 11px var(--font); color:var(--coral); letter-spacing:1px; }
-    .message-tag { font:10px var(--font); color:var(--muted); padding:1px 6px; border:1px dashed var(--line); border-radius:10px; }
     .message-bubble { position:relative; grid-area:bubble; padding:10px 14px 38px; border:1px solid var(--line); border-radius:14px; background:#f4f6f2; box-shadow:2px 3px 0 #dfe7de; font-size:16px; line-height:1.6; overflow-wrap:anywhere; white-space:pre-wrap; width:fit-content; max-width:50%; min-width:150px; }
     .message-text { display:block; }
     .message-file { min-width:230px; max-width:360px; display:grid; grid-template-columns:minmax(0,1fr) auto; grid-template-areas:'name download' 'meta download'; gap:1px 12px; align-items:center; white-space:normal; }
@@ -392,16 +419,26 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .modal-backdrop { position:fixed; inset:0; z-index:20; display:grid; place-items:center; padding:20px; background:#17211bcc; backdrop-filter:blur(2px); }
     .modal-backdrop[hidden] { display:none; }
     .modal { width:min(460px,100%); padding:22px; border:1px solid var(--ink); background:var(--white); box-shadow:7px 7px 0 var(--lime); }
+    .modal.admin-modal-wide { width:min(460px,100%); max-height:calc(100dvh - 40px); overflow:auto; }
+    .modal.admin-modal-wide.tools-open { width:min(1080px,100%); }
     .modal h2 { margin:0 0 18px; font-size:22px; font-weight:400; }
-    .modal input { width:100%; margin-bottom:12px; }
+    .modal input,.modal select { width:100%; margin-bottom:12px; }
     .modal-actions { display:flex; justify-content:flex-end; gap:8px; }
     .modal-actions button { height:40px; }
-    .admin-channels { display:flex; flex-direction:column; gap:10px; margin-bottom:18px; }
+    .admin-tools-layout { display:grid; grid-template-columns:minmax(320px,1.15fr) minmax(230px,.85fr) minmax(280px,1fr); gap:14px; align-items:start; margin-bottom:18px; }
+    .admin-tool-panel { min-width:0; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(255,255,255,.3); }
+    .admin-tool-panel h3 { margin:0 0 13px; font:700 12px var(--font); letter-spacing:1.4px; }
+    .admin-channels { display:flex; flex-direction:column; gap:10px; margin:0; }
     .admin-channel-row { display:grid; grid-template-columns:75px 1fr 60px; gap:8px; align-items:center; font-size:13px; }
     .admin-channel-row input { height:38px; margin:0; }
     .admin-channel-row button { min-width:0; height:38px; padding:0 8px; }
-    .admin-ban-tools { border-top:1px solid var(--line); padding-top:16px; margin-top:4px; }
-    .admin-ban-tools h3 { margin:0 0 10px; font:700 11px var(--font); letter-spacing:1.5px; }
+    .admin-settings { display:flex; flex-direction:column; gap:14px; }
+    .admin-setting-row { display:grid; gap:7px; color:var(--muted); font-size:12px; }
+    .admin-setting-row input { height:40px; margin:0; padding:0 12px; border:1px solid var(--line); border-radius:12px; color:var(--ink); background:rgba(255,255,255,.72); outline:none; font:600 13px var(--font); }
+    .admin-setting-row input:focus { border-color:var(--ios-blue,#268ee6); box-shadow:0 0 0 3px rgba(10,132,255,.12); }
+    .admin-settings-save { width:100%; height:40px; margin-top:2px; }
+    .admin-settings-note { margin:0; color:var(--muted); font:11px/1.6 var(--font); }
+    .admin-ban-tools { margin:0; }
     .admin-ban-entry { display:grid; grid-template-columns:minmax(0,1fr) 72px; gap:8px; }
     .admin-ban-entry input, .admin-ban-entry button { height:40px; margin:0; }
     .admin-ban-entry button { min-width:0; padding:0 8px; }
@@ -410,6 +447,15 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .banned-row button { min-width:0; height:32px; padding:0 6px; background:var(--paper); }
     .banned-empty { color:var(--muted); font-size:11px; padding:5px 0; }
     .user-detail { color:var(--muted); font:14px/1.8 var(--font); }
+    @media (max-width:900px) {
+      .admin-tools-layout { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .admin-ban-tools { grid-column:1/-1; }
+    }
+    @media (max-width:620px) {
+      .modal.admin-modal-wide { max-height:calc(100dvh - 20px); padding:16px; }
+      .admin-tools-layout { grid-template-columns:1fr; }
+      .admin-ban-tools { grid-column:auto; }
+    }
     .user-detail b { color:var(--ink); font-weight:400; }
     .metric { padding:18px 0; border-top:1px solid #cbd3cc; }
     .metric-label { display:block; margin-bottom:8px; color:var(--muted); font:10px var(--font); }
@@ -535,7 +581,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .message-avatar .lucide { width:16px; height:16px; }
     .message-meta { gap:9px; }
     .message-name { color:var(--signal); font-size:9px; letter-spacing:.16em; text-transform:uppercase; }
-    .message-tag { padding:1px 5px; color:var(--acid); border-color:var(--hair-hot); border-radius:0; font-size:8px; }
     .message-bubble { min-width:160px; max-width:min(64%,620px); padding:12px 15px 35px; color:#d6d5cb; border-color:var(--hair); border-radius:0; background:rgba(237,234,221,.045); box-shadow:none; font-size:14px; line-height:1.7; backdrop-filter:blur(8px); }
     .message-bubble::before { content:''; position:absolute; left:-1px; top:-1px; width:18px; height:1px; background:var(--signal); }
     .message.self .message-bubble { color:var(--void); border-color:var(--acid); background:var(--acid); box-shadow:8px 8px 0 rgba(200,255,54,.1); }
@@ -711,7 +756,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .empty::before { background:#fff; box-shadow:0 4px 20px rgba(255,255,255,.7); }
     .message-avatar { color:#fff; border-color:rgba(255,255,255,.28); border-radius:50%; background:rgba(255,255,255,.1); }
     .message-name { color:rgba(255,255,255,.82); font-weight:500; }
-    .message-tag { color:#fff; border-color:rgba(255,255,255,.35); border-radius:999px; }
     .message-bubble { color:#fff; border:1px solid rgba(255,255,255,.24); border-radius:22px 22px 22px 7px; background:rgba(255,255,255,.11); box-shadow:0 12px 32px rgba(48,79,115,.1),inset 0 1px 1px rgba(255,255,255,.2); backdrop-filter:blur(22px); }
     .message-bubble::before { display:none; }
     .message.self .message-bubble { color:var(--blue-ink); border-color:rgba(255,255,255,.72); border-radius:22px 22px 7px 22px; background:rgba(255,255,255,.9); box-shadow:0 16px 38px rgba(48,79,115,.14),inset 0 1px 1px #fff; }
@@ -829,7 +873,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .empty::before { background:var(--navy); box-shadow:0 5px 18px rgba(24,58,91,.25); }
     .message-avatar { color:var(--navy); border-color:rgba(255,255,255,.7); background:rgba(255,255,255,.42); }
     .message-name { color:var(--navy); }
-    .message-tag { color:var(--navy-2); border-color:rgba(24,58,91,.25); }
     .message-bubble { color:var(--navy); border-color:rgba(255,255,255,.7); background:rgba(255,255,255,.38); box-shadow:0 12px 32px rgba(48,79,115,.1),inset 0 1px 1px rgba(255,255,255,.82); }
     .message.self .message-bubble { color:#fff; border-color:rgba(24,58,91,.72); background:linear-gradient(145deg,#244d72,#183a5b); box-shadow:0 16px 38px rgba(35,72,106,.22),inset 0 1px 1px rgba(255,255,255,.16); }
     .message.self .message-avatar { color:#fff; border-color:var(--navy); background:var(--navy); }
@@ -952,7 +995,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .empty::before { width:32px; height:3px; border-radius:3px; background:var(--ios-blue); box-shadow:none; }
     .message-avatar { color:var(--ios-blue); border-color:rgba(255,255,255,.78); border-radius:14px; background:rgba(255,255,255,.66); box-shadow:0 5px 12px rgba(48,70,96,.08); }
     .message-name { color:var(--ios-secondary); font-weight:650; letter-spacing:.06em; }
-    .message-tag { color:var(--ios-blue); border-color:rgba(10,132,255,.2); border-radius:999px; }
     .message-bubble { color:var(--ios-ink); border:1px solid rgba(255,255,255,.78); border-radius:21px 21px 21px 7px; background:rgba(255,255,255,.68); box-shadow:0 8px 22px rgba(43,66,92,.09),inset 0 1px 1px #fff; backdrop-filter:none; }
     .message.self .message-bubble { color:#fff; border-color:rgba(10,132,255,.75); border-radius:21px 21px 7px 21px; background:linear-gradient(145deg,#339cff,#0a84ff); box-shadow:0 10px 24px rgba(10,132,255,.22),inset 0 1px 1px rgba(255,255,255,.3); }
     .message.self .message-avatar { color:#fff; border-color:rgba(10,132,255,.75); background:var(--ios-blue); }
@@ -1065,7 +1107,6 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .chat-meta { font-size:10px; }
     .chat-meta b { font-size:12px; }
     .message-name { font-size:11px; }
-    .message-tag { font-size:10px; }
     .message-time { font-size:11px; }
     .file-meta { font-size:12px; }
     .file-download { font-size:12px; }
@@ -1146,6 +1187,28 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .message.self .message-action,
     .message.self .message-time { color:var(--ios-secondary); }
     .message.self .message-action:hover { color:var(--ios-blue); background:rgba(255,255,255,.46); }
+    .file-download,
+    .file-download:visited {
+      color:#17496f;
+      border-color:rgba(23,73,111,.28);
+      background:
+        radial-gradient(circle at 25% 0%,rgba(255,255,255,.98),transparent 50%),
+        linear-gradient(145deg,rgba(255,255,255,.84),rgba(216,235,251,.7));
+      box-shadow:0 5px 14px rgba(32,71,105,.13),inset 0 1px 1px #fff;
+      font-weight:750;
+    }
+    .file-download .lucide { color:#0b72c9; stroke-width:2.5; }
+    .file-download:hover {
+      color:#fff;
+      border-color:rgba(10,106,190,.72);
+      background:linear-gradient(145deg,#268ee6,#0a6abe);
+      box-shadow:0 7px 18px rgba(10,106,190,.24),inset 0 1px 1px rgba(255,255,255,.34);
+    }
+    .file-download:hover .lucide { color:#fff; }
+    .file-download:focus-visible {
+      outline:3px solid rgba(10,132,255,.24);
+      outline-offset:2px;
+    }
     button,
     #send,
     .file-toggle,
@@ -1196,12 +1259,25 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     .admin-channel-row button,
     .admin-ban-entry button,
     .banned-row button,
+    .admin-settings-save,
     .modal-actions button,
     body.mobile-users-open .profile-panel .mobile-users-close {
       color:var(--ios-ink);
       border-color:rgba(255,255,255,.9);
       background:linear-gradient(145deg,rgba(255,255,255,.82),rgba(223,238,251,.56));
       box-shadow:0 6px 16px rgba(42,68,94,.1),inset 0 1px 1px #fff;
+    }
+    .admin-tool-panel {
+      border-color:rgba(255,255,255,.82);
+      background:linear-gradient(145deg,rgba(255,255,255,.62),rgba(225,239,251,.42));
+      box-shadow:0 10px 24px rgba(42,68,94,.09),inset 0 1px 1px #fff;
+    }
+    .admin-setting-row { color:var(--ios-secondary); }
+    .admin-setting-row input {
+      color:var(--ios-ink);
+      border-color:rgba(255,255,255,.9);
+      background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(226,239,251,.62));
+      box-shadow:inset 0 1px 1px #fff;
     }
     @media (max-width:700px) {
       #send { color:var(--ios-ink); }
@@ -1351,6 +1427,26 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       box-shadow:0 12px 30px rgba(39,62,88,.13),0 0 0 3px rgba(10,132,255,.08),inset 0 1px 1px #fff;
     }
   </style>
+  <style id="admin-input-caret-cue">
+    #admin-password,
+    #admin-retention,
+    #admin-file-limit {
+      position:relative;
+      z-index:1;
+      cursor:text!important;
+      caret-color:var(--ios-blue)!important;
+      user-select:text;
+      -webkit-user-select:text;
+      pointer-events:auto;
+    }
+    #admin-password:focus,
+    #admin-retention:focus,
+    #admin-file-limit:focus {
+      outline:none;
+      border-color:rgba(10,132,255,.55);
+      box-shadow:0 0 0 4px rgba(10,132,255,.12),inset 0 1px 1px #fff;
+    }
+  </style>
   <style id="nickname-avatar-system">
     .avatar-initial {
       --avatar-from:#4ca4ff;
@@ -1425,19 +1521,56 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         <div class="identity"><div class="avatar" id="my-avatar"></div><div><small>YOUR SIGNAL</small><input id="my-name" maxlength="5" value="匿名访客" aria-label="编辑用户名"></div></div>
         <div class="user-directory"><div class="user-directory-head"><span>ONLINE SIGNALS</span><span id="user-count">0</span></div><div class="search-shell"><svg class="lucide"><use href="#lucide-search"></use></svg><input class="user-search" id="user-search" type="search" placeholder="检索在线用户" aria-label="搜索在线用户"></div><div class="user-list" id="user-list"></div></div>
       </aside>
-      <section class="chat"><div class="chat-top"><div class="chat-title" id="channel-title">唠嗑</div><select class="mobile-channel-select" id="mobile-channel-select" aria-label="切换频道"></select><button class="mobile-users-toggle" id="mobile-users-toggle" type="button" aria-label="查看在线用户" aria-expanded="false"><svg class="lucide"><use href="#lucide-users"></use></svg><span>用户</span><span class="mobile-unread-count" id="mobile-unread-count" hidden></span></button><div class="chat-meta"><span id="channel-code">CHANNEL / 01</span><span><span id="scope-label">本频道</span> <b id="online">0</b></span><span>全站 <b id="total-online-inline">0</b>/100</span></div></div><div class="messages" id="messages"><div class="messages-spacer" id="messages-spacer"><div class="messages-window" id="messages-window"></div></div></div><form class="composer" id="composer"><div class="emoji-wrap"><button class="emoji-toggle" id="emoji-toggle" type="button" aria-label="打开表情面板" aria-expanded="false"><svg class="lucide"><use href="#lucide-smile"></use></svg></button><div class="emoji-panel" id="emoji-panel" hidden></div></div><button class="file-toggle" id="file-toggle" type="button" title="发送文件（最大 1 MB，5 分钟后销毁）" aria-label="选择文件"><svg class="lucide"><use href="#lucide-paperclip"></use></svg></button><input class="file-input" id="file-input" type="file" tabindex="-1"><input id="message" maxlength="500" autocomplete="off" placeholder="说点什么……"><button id="send" type="submit"><span class="send-label">发送</span><svg class="lucide"><use href="#lucide-send"></use></svg></button></form></section>
-      <aside class="room-panel"><h2><svg class="lucide"><use href="#lucide-hash"></use></svg><span>CHANNELS</span></h2><div class="channel-list" id="channel-list"></div><div class="metric"><span class="metric-label">全站在线 / CAPACITY</span><div class="metric-value online-value"><span id="total-online">0</span> / 100</div></div><div class="rules"><b>温馨提示</b><br><b>消息与文件仅保留 5 分钟</b><br>发送后 3 分钟内可以撤回<br>公共频道与私聊均可发送文件<br>单个文件最大 1 MB<br>每 5 秒最多发送 2 条内容</div><div class="room-admin-entry"><div class="admin-status" id="admin-status" hidden></div><div class="sync" id="refresh">等待同步</div></div></aside>
+      <section class="chat"><div class="chat-top"><div class="chat-title" id="channel-title">频道1</div><select class="mobile-channel-select" id="mobile-channel-select" aria-label="切换频道"></select><button class="mobile-users-toggle" id="mobile-users-toggle" type="button" aria-label="查看在线用户" aria-expanded="false"><svg class="lucide"><use href="#lucide-users"></use></svg><span>用户</span><span class="mobile-unread-count" id="mobile-unread-count" hidden></span></button><div class="chat-meta"><span id="channel-code">CHANNEL / 01</span><span><span id="scope-label">本频道</span> <b id="online">0</b></span><span>全站 <b id="total-online-inline">0</b>/100</span></div></div><div class="messages" id="messages"><div class="messages-spacer" id="messages-spacer"><div class="messages-window" id="messages-window"></div></div></div><form class="composer" id="composer"><div class="emoji-wrap"><button class="emoji-toggle" id="emoji-toggle" type="button" aria-label="打开表情面板" aria-expanded="false"><svg class="lucide"><use href="#lucide-smile"></use></svg></button><div class="emoji-panel" id="emoji-panel" hidden></div></div><button class="file-toggle" id="file-toggle" type="button" title="发送文件（最大 1 MB，5 分钟后销毁）" aria-label="选择文件"><svg class="lucide"><use href="#lucide-paperclip"></use></svg></button><input class="file-input" id="file-input" type="file" tabindex="-1"><input id="message" maxlength="500" autocomplete="off" placeholder="说点什么……"><button id="send" type="submit"><span class="send-label">发送</span><svg class="lucide"><use href="#lucide-send"></use></svg></button></form></section>
+      <aside class="room-panel"><h2><svg class="lucide"><use href="#lucide-hash"></use></svg><span>CHANNELS</span></h2><div class="channel-list" id="channel-list"></div><div class="metric"><span class="metric-label">全站在线 / CAPACITY</span><div class="metric-value online-value"><span id="total-online">0</span> / 100</div></div><div class="rules"><b>温馨提示</b><br><b id="retention-rule">消息与文件仅保留 5 分钟</b><br>发送后 3 分钟内可以撤回<br>公共频道与私聊均可发送文件<br><span id="file-limit-rule">单个文件最大 1 MB</span><br>每 5 秒最多发送 2 条内容</div><div class="room-admin-entry"><div class="admin-status" id="admin-status" hidden></div><div class="sync" id="refresh">等待同步</div></div></aside>
     </main>
   </div>
   <div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
   <button class="fab-admin" id="fab-admin" type="button" hidden><svg class="lucide"><use href="#lucide-shield-check"></use></svg><span>验证管理员</span></button>
-  <div class="modal-backdrop" id="admin-modal" hidden><div class="modal"><h2 id="admin-modal-title">验证管理员</h2><div id="admin-login"><input id="admin-password" type="password" inputmode="numeric" placeholder="输入管理员密码"><div class="modal-actions"><button type="button" data-close="admin-modal">取消</button><button type="button" id="admin-login-button">验证</button></div></div><div id="admin-tools" hidden><div class="admin-channels" id="admin-channels"></div><div class="admin-ban-tools"><h3>IP 封禁管理</h3><div class="admin-ban-entry"><input id="admin-ban-ip" placeholder="输入 IP 地址" aria-label="要封禁的 IP 地址"><button type="button" id="admin-ban-button">封禁</button></div><div class="banned-list" id="banned-list"></div></div><div class="modal-actions"><button type="button" data-close="admin-modal">完成</button></div></div></div></div>
+  <div class="modal-backdrop" id="admin-modal" hidden>
+    <div class="modal admin-modal-wide">
+      <h2 id="admin-modal-title">验证管理员</h2>
+      <div id="admin-login"><input id="admin-password" type="password" autocomplete="current-password" placeholder="输入管理员密码"><div class="modal-actions"><button type="button" data-close="admin-modal">取消</button><button type="button" id="admin-login-button">验证</button></div></div>
+      <div id="admin-tools" hidden>
+        <div class="admin-tools-layout">
+          <section class="admin-tool-panel"><h3>频道名称</h3><div class="admin-channels" id="admin-channels"></div></section>
+          <section class="admin-tool-panel">
+            <h3>内容限制</h3>
+            <div class="admin-settings">
+              <label class="admin-setting-row"><span>消息与文件销毁时间（分钟）</span><input id="admin-retention" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="5" autocomplete="off" aria-label="销毁时间，单位分钟，仅允许输入数字"></label>
+              <label class="admin-setting-row"><span>单个文件大小上限（MB，最高 20 GB）</span><input id="admin-file-limit" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="5" value="1" autocomplete="off" aria-label="文件大小上限，单位 MB，最高 20 GB，仅允许输入数字"></label>
+              <button class="admin-settings-save" type="button" id="admin-settings-save">应用设置</button>
+              <p class="admin-settings-note">可输入 1–1440 分钟和 1–20480 MB（20 GB）。设置实时同步给所有在线用户；服务重启后恢复为 5 分钟和 1 MB。</p>
+            </div>
+          </section>
+          <section class="admin-tool-panel admin-ban-tools"><h3>IP 封禁管理</h3><div class="admin-ban-entry"><input id="admin-ban-ip" placeholder="输入 IP 地址" aria-label="要封禁的 IP 地址"><button type="button" id="admin-ban-button">封禁</button></div><div class="banned-list" id="banned-list"></div></section>
+        </div>
+        <div class="modal-actions"><button type="button" data-close="admin-modal">完成</button></div>
+      </div>
+    </div>
+  </div>
   <div class="modal-backdrop" id="user-modal" hidden><div class="modal"><h2>用户信息</h2><div class="user-detail" id="user-detail">正在读取</div><div class="modal-actions"><button type="button" data-close="user-modal">关闭</button></div></div></div>
   <div class="blocker" id="blocker" hidden><div class="blocker-card"><h2 id="blocker-title">ROOM IS FULL</h2><p id="blocker-message">当前聊天室同时在线已满，新的连接暂时无法进入。请稍后刷新再试，或等待现有连接超时释放。</p><div class="blocker-meta"><span id="blocker-meta-limit">LIMIT 100</span><span id="blocker-retry">RETRY IN 5s</span></div></div></div>
   <script>
     const names = ['雾中信号','午夜电台','路过的人','蓝色回声','未读消息','七号窗口','风的背面','纸上月光','无名之声','半格电量','雨后电台','凌晨三点','玻璃海岸','远方来客','静默频道','白噪音','南墙以北','小行星带','旧磁带','临时月亮','低空飞行','纸船渡口','橘色回声','没有署名','第九街角','慢速星球','失眠旅人','空白信笺','北纬三十','候车室里','微光入口','借过一下','晴天留声机','倒带之前','未完句号','晚风收件箱','路灯下面','隐身模式','落日存档','匿名观测员','月面漫步者','雨伞借我','发呆俱乐部','半夜醒来','蓝调星期五','海边的字','轻声路过','没有目的地','风筝线外','借来的名字'];
     const avatarIcons = ['orbit','radio','circle-dot-dashed','triangle','hexagon','asterisk','scan-line','waves','box'];
-    const identity = { name:names[Math.floor(Math.random()*names.length)], avatar:avatarIcons[Math.floor(Math.random()*avatarIcons.length)], id:crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) };
+    const LOCAL_NAME_KEY = 'void-chat.user-name.v1';
+    function normalizedName(value) { return Array.from(String(value||'').trim()).slice(0,5).join(''); }
+    function readLocalName() {
+      try { return normalizedName(localStorage.getItem(LOCAL_NAME_KEY)); }
+      catch { return ''; }
+    }
+    function saveLocalName(value) {
+      const name=normalizedName(value);
+      try {
+        if(name) localStorage.setItem(LOCAL_NAME_KEY,name);
+        else localStorage.removeItem(LOCAL_NAME_KEY);
+      } catch {}
+      return name;
+    }
+    const localName=readLocalName();
+    const identity = { name:localName||names[Math.floor(Math.random()*names.length)], avatar:avatarIcons[Math.floor(Math.random()*avatarIcons.length)], id:crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) };
+    saveLocalName(identity.name);
     const state = { messages:[], users:[], privateUnread:{}, privateActivity:{}, online:0, cursor:0, polling:false, uploading:false, nameEdited:false, mode:'channel', peer:null, channel:'channel1', channels:[], onlineByChannel:{}, adminToken:'', full:false, blockedReason:'', sendCooldownUntil:0, retentionMs:300000, recallWindowMs:180000, maxFileBytes:1048576, renderBatch:100, pollInterval:1500, blockRetry:5000, canAdmin:false, scrollLocked:true };
     const $ = id => document.getElementById(id);
     const renderCache = { channels:'', users:'' };
@@ -1615,7 +1748,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       row.dataset.sender = m.senderId || '';
       row.dataset.at = String(m.at);
       row.dataset.expiresAt = String(m.at + state.retentionMs);
-      row.innerHTML = '<div class="message-avatar"></div><div class="message-meta"><div class="message-name"></div><div class="message-tag" hidden></div></div><div class="message-bubble"><span class="message-text"></span><div class="message-file" hidden><div class="file-name"></div><div class="file-meta"></div><a class="file-download"></a></div><div class="message-footer"><button class="message-action copy-action" type="button" title="复制消息" aria-label="复制消息"></button><time class="message-time"></time><button class="message-action recall-action" type="button" title="撤回消息" aria-label="撤回消息"></button></div></div>';
+      row.innerHTML = '<div class="message-avatar"></div><div class="message-meta"><div class="message-name"></div></div><div class="message-bubble"><span class="message-text"></span><div class="message-file" hidden><div class="file-name"></div><div class="file-meta"></div><a class="file-download"></a></div><div class="message-footer"><button class="message-action copy-action" type="button" title="复制消息" aria-label="复制消息"></button><time class="message-time"></time><button class="message-action recall-action" type="button" title="撤回消息" aria-label="撤回消息"></button></div></div>';
       setAvatarInitial(row.querySelector('.message-avatar'),m.name);
       row.querySelector('.message-name').textContent = m.name;
       const textNode=row.querySelector('.message-text');
@@ -1624,13 +1757,11 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       if(m.file&&!m.recalled) {
         textNode.hidden=true; fileCard.hidden=false;
         row.querySelector('.file-name').textContent=m.file.name;
-        row.querySelector('.file-meta').textContent=formatFileSize(m.file.size)+' · 5 分钟后销毁';
+        row.querySelector('.file-meta').textContent=formatFileSize(m.file.size)+' · '+formatDuration(state.retentionMs)+'后销毁';
         const download=row.querySelector('.file-download');
         download.href=apiBase+'/api/file/'+encodeURIComponent(m.file.id)+'?client='+encodeURIComponent(identity.id)+'&token='+encodeURIComponent(m.file.token);
         download.download=m.file.name; download.title='下载 '+m.file.name; download.append(iconNode('download'),document.createTextNode('下载'));
       }
-      const tag = row.querySelector('.message-tag');
-      if (self) { tag.hidden = false; tag.textContent = '我'; }
       const copyButton=row.querySelector('.copy-action');
       const recallButton=row.querySelector('.recall-action');
       setIcon(copyButton,'copy'); setIcon(recallButton,'rotate-ccw');
@@ -1641,7 +1772,21 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       updateMessageCountdown(row, m.at);
       return row;
     }
-    function formatFileSize(bytes) { return bytes<1024?bytes+' B':(bytes/1024).toFixed(bytes<10240?1:0)+' KB'; }
+    function formatFileSize(bytes) {
+      if(bytes<1024) return bytes+' B';
+      if(bytes<1024*1024) return (bytes/1024).toFixed(bytes<10240?1:0)+' KB';
+      if(bytes>=1024*1024*1024) {
+        const gigabytes=bytes/(1024*1024*1024);
+        return gigabytes.toFixed(Number.isInteger(gigabytes)?0:1)+' GB';
+      }
+      const megabytes=bytes/(1024*1024);
+      return megabytes.toFixed(Number.isInteger(megabytes)?0:1)+' MB';
+    }
+    function formatDuration(ms) { return Math.round(ms/60000)+' 分钟'; }
+    function syncLimitUI() {
+      setText($('retention-rule'),'消息与文件仅保留 '+formatDuration(state.retentionMs));
+      setText($('file-limit-rule'),'单个文件最大 '+formatFileSize(state.maxFileBytes));
+    }
     function formatRemaining(ms) {
       const seconds = Math.max(0, Math.ceil(ms / 1000));
       return String(Math.floor(seconds / 60)).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0');
@@ -1713,7 +1858,8 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       $('send').disabled=state.full||state.uploading||cooling||peerOffline;
       $('file-toggle').hidden=false;
       $('file-toggle').disabled=state.full||state.uploading||cooling||peerOffline;
-      $('file-toggle').title=peerOffline?'对方已离线':state.uploading?'正在上传文件':state.mode==='private'?'发送私聊文件（最大 1 MB，5 分钟后销毁）':'发送频道文件（最大 1 MB，5 分钟后销毁）';
+      const fileRule='最大 '+formatFileSize(state.maxFileBytes)+'，'+formatDuration(state.retentionMs)+'后销毁';
+      $('file-toggle').title=peerOffline?'对方已离线':state.uploading?'正在上传文件':state.mode==='private'?'发送私聊文件（'+fileRule+'）':'发送频道文件（'+fileRule+'）';
       $('file-toggle').classList.toggle('is-uploading',state.uploading);
       setIcon($('file-toggle'),state.uploading?'radio':'paperclip');
     }
@@ -1909,6 +2055,10 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       });
       root.replaceChildren(fragment);
     }
+    function renderAdminSettings() {
+      $('admin-retention').value=String(Math.round(state.retentionMs/60000));
+      $('admin-file-limit').value=String(Math.round(state.maxFileBytes/(1024*1024)));
+    }
     function renderBans(bans) {
       const root=$('banned-list');
       if(!bans.length) { const empty=document.createElement('div'); empty.className='banned-empty'; empty.textContent='当前没有被封禁的 IP'; root.replaceChildren(empty); return; }
@@ -1933,6 +2083,43 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       if(!response.ok) { $('admin-ban-ip').value=''; $('admin-ban-ip').placeholder=data.error==='cannot ban local address'?'不能封禁服务器本机地址':'IP 地址无效或操作失败'; showToast(data.error==='cannot ban local address'?'不能封禁服务器本机地址':'IP 地址无效或操作失败','error'); return false; }
       renderBans(data.bans||[]); $('admin-ban-ip').value=''; $('admin-ban-ip').placeholder='输入 IP 地址'; showToast(banned?'IP 已封禁':'IP 已解除封禁','success'); return true;
     }
+    async function saveAdminSettings() {
+      const button=$('admin-settings-save');
+      const retentionInput=$('admin-retention');
+      const fileLimitInput=$('admin-file-limit');
+      const digitsOnly=/^[0-9]+$/;
+      const retentionMinutes=Number(retentionInput.value);
+      const fileMegabytes=Number(fileLimitInput.value);
+      if(!digitsOnly.test(retentionInput.value)||!Number.isInteger(retentionMinutes)||retentionMinutes<1||retentionMinutes>1440) {
+        retentionInput.focus();
+        showToast('销毁时间请输入 1–1440 之间的整数分钟','warning');
+        return;
+      }
+      if(!digitsOnly.test(fileLimitInput.value)||!Number.isInteger(fileMegabytes)||fileMegabytes<1||fileMegabytes>20480) {
+        fileLimitInput.focus();
+        showToast('文件上限请输入 1–20480 之间的整数 MB','warning');
+        return;
+      }
+      button.disabled=true;
+      try {
+        const response=await fetch(apiBase+'/api/admin/settings',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':state.adminToken},body:JSON.stringify({retentionMinutes:retentionInput.value,fileMegabytes:fileLimitInput.value})});
+        const data=await response.json().catch(()=>({}));
+        if(!response.ok) throw Error(data.error||'settings failed');
+        if(typeof data.retentionMs==='number') state.retentionMs=data.retentionMs;
+        if(typeof data.maxFileBytes==='number') state.maxFileBytes=data.maxFileBytes;
+        syncLimitUI();
+        updateComposerControls();
+        tick();
+        button.textContent='已应用';
+        showToast('内容限制已实时更新','success');
+      } catch {
+        button.textContent='应用失败';
+        showToast('内容限制更新失败，请重试','error');
+      } finally {
+        button.disabled=false;
+        setTimeout(()=>button.textContent='应用设置',1000);
+      }
+    }
     function setAdminVerifiedUI() {
       document.body.classList.add('admin-mode');
       $('fab-admin').classList.add('verified');
@@ -1942,6 +2129,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     }
     function openAdmin() {
       $('admin-modal').hidden=false;
+      $('admin-modal').querySelector('.modal').classList.toggle('tools-open',!!state.adminToken);
       $('admin-password').value='';
       $('admin-password').placeholder='输入管理员密码';
       if(state.adminToken) {
@@ -1949,11 +2137,13 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         $('admin-tools').hidden=false;
         $('admin-modal-title').textContent='管理员工具';
         renderAdminChannels();
+        renderAdminSettings();
         loadBans();
       } else {
         $('admin-login').hidden=false;
         $('admin-tools').hidden=true;
         $('admin-modal-title').textContent='验证管理员';
+        requestAnimationFrame(()=>$('admin-password').focus());
       }
     }
     function tick() {
@@ -1969,6 +2159,11 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         const message=messageById.get(id);
         if (message) {
           updateMessageCountdown(row, message.at);
+          const fileMeta=row.querySelector('.file-meta');
+          if(fileMeta&&message.file&&!message.recalled) {
+            const nextMeta=formatFileSize(message.file.size)+' · '+formatDuration(state.retentionMs)+'后销毁';
+            if(fileMeta.textContent!==nextMeta) fileMeta.textContent=nextMeta;
+          }
           const recallButton=row.querySelector('.recall-action');
           if(recallButton) recallButton.hidden=message.recalled||message.senderId!==identity.id||now-message.at>state.recallWindowMs;
         }
@@ -2042,10 +2237,11 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         state.blockedReason='';
         updateBlocker(false);
         $('send').disabled=Date.now()<state.sendCooldownUntil;
-        if(!state.nameEdited && data.assignedName) {
+        if(!state.nameEdited && data.assignedName && data.assignedName!==identity.name) {
           identity.name=data.assignedName;
           $('my-name').value=data.assignedName;
           setAvatarInitial($('my-avatar'),identity.name);
+          saveLocalName(identity.name);
         }
         if(typeof data.renderBatch === 'number') state.renderBatch = data.renderBatch;
         if(typeof data.pollInterval === 'number') state.pollInterval = data.pollInterval;
@@ -2060,7 +2256,8 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
         state.privateUnread=data.privateUnread||{};
         state.privateActivity=data.privateActivity||{};
         if(state.mode==='private'&&data.peer) state.peer=data.peer;
-        state.retentionMs=data.retentionMs;
+        if(typeof data.retentionMs==='number') state.retentionMs=data.retentionMs;
+        syncLimitUI();
         const root=$('messages');
         const wasLocked = state.scrollLocked;
         const atBottom = wasLocked || Math.abs((root.scrollTop + root.clientHeight) - root.scrollHeight) < 6;
@@ -2111,6 +2308,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       identity.name=Array.from(e.target.value).slice(0,5).join('');
       e.target.value=identity.name;
       setAvatarInitial($('my-avatar'),identity.name);
+      saveLocalName(identity.name);
     });
     $('mobile-users-toggle').addEventListener('click',()=>setMobileUsersOpen(true));
     $('mobile-users-close').addEventListener('click',()=>setMobileUsersOpen(false));
@@ -2131,7 +2329,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       const peerId=requestedMode==='private'?(state.peer?.id||''):'';
       const channelId=state.channel;
       if(requestedMode==='private'&&!peerId) { e.target.value=''; showToast('当前私聊会话不可用','warning'); return; }
-      if(file.size<=0||file.size>state.maxFileBytes) { e.target.value=''; const tip=file.size<=0?'不能发送空文件':'文件不能超过 1 MB'; $('connection').textContent=tip; showToast(tip,'warning'); return; }
+      if(file.size<=0||file.size>state.maxFileBytes) { e.target.value=''; const tip=file.size<=0?'不能发送空文件':'文件不能超过 '+formatFileSize(state.maxFileBytes); $('connection').textContent=tip; showToast(tip,'warning'); return; }
       state.uploading=true; updateComposerControls(); $('connection').textContent='正在发送 '+file.name; showToast('正在发送 '+file.name,'info');
       let cooldown=0;
       try {
@@ -2145,7 +2343,10 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
           setTimeout(()=>{ if(Date.now()>=state.sendCooldownUntil) { updateComposerControls(); $('connection').textContent='已连接'; } },cooldown);
           throw Error('rate limit');
         }
-        if(!response.ok) throw Error(data.error||'upload failed');
+        if(!response.ok) {
+          if(typeof data.limit==='number'&&data.limit>0) { state.maxFileBytes=data.limit; syncLimitUI(); updateComposerControls(); }
+          throw Error(data.error||'upload failed');
+        }
         const stillViewingTarget=requestedMode==='private'?(state.mode==='private'&&state.peer?.id===peerId):(state.mode==='channel'&&state.channel===channelId);
         if(stillViewingTarget&&!state.messages.some(message=>message.id===data.message?.id)) {
           state.messages.push(data.message); state.scrollLocked=true; render({newIds:[data.message.id],scrollToBottom:true});
@@ -2155,7 +2356,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       } catch(error) {
         if(error.message==='peer offline') { if(state.peer?.id===peerId) state.peer.online=false; $('connection').textContent='对方已离线，文件未发送'; showToast('对方已离线，文件未发送','warning'); renderChannels(); }
         else if(error.message==='channel changed') { $('connection').textContent='频道已切换，文件未发送'; showToast('频道已经切换，请重新选择文件','warning'); }
-        else if(error.message==='file too large') { $('connection').textContent='文件不能超过 1 MB'; showToast('文件不能超过 1 MB','warning'); }
+        else if(error.message==='file too large') { const tip='文件不能超过 '+formatFileSize(state.maxFileBytes); $('connection').textContent=tip; showToast(tip,'warning'); }
         else if(error.message!=='rate limit') { $('connection').textContent='文件发送失败，请重试'; showToast('文件发送失败，请重试','error'); }
       } finally {
         state.uploading=false; e.target.value=''; updateComposerControls();
@@ -2166,8 +2367,9 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       const input=$('message');
       const text=input.value.trim();
       if(!text || state.full) return;
-      identity.name=Array.from($('my-name').value.trim()).slice(0,5).join('')||'匿名访客';
+      identity.name=normalizedName($('my-name').value)||'匿名访客';
       $('my-name').value=identity.name;
+      saveLocalName(identity.name);
       $('send').disabled=true;
       let cooldown=0;
       try {
@@ -2189,6 +2391,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
           identity.name=data.name;
           $('my-name').value=data.name;
           setAvatarInitial($('my-avatar'),identity.name);
+          saveLocalName(identity.name);
         }
         input.value='';
         state.scrollLocked = true;
@@ -2207,12 +2410,24 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     fetch(apiBase+'/api/status').then(response=>response.json()).then(data=>{
       state.canAdmin = !!data.canAdmin;
       state.limit = data.limit || state.limit;
+      if(typeof data.retentionMs==='number') state.retentionMs=data.retentionMs;
       if(typeof data.maxFileBytes==='number') state.maxFileBytes=data.maxFileBytes;
+      syncLimitUI();
+      updateComposerControls();
       if(state.canAdmin) {
         $('fab-admin').hidden=false;
       }
     }).catch(()=>{});
     $('fab-admin').addEventListener('click',openAdmin);
+    [$('admin-retention'),$('admin-file-limit')].forEach(input=>input.addEventListener('input',()=>{
+      const sanitized=input.value.replace(/[^0-9]/g,'').slice(0,input.maxLength);
+      if(input.value!==sanitized) input.value=sanitized;
+    }));
+    $('admin-password').addEventListener('keydown',event=>{
+      if(event.key!=='Enter'||event.isComposing) return;
+      event.preventDefault();
+      if(!$('admin-login-button').disabled) $('admin-login-button').click();
+    });
     $('admin-login-button').addEventListener('click',async()=>{
       const btn = $('admin-login-button');
       btn.disabled = true;
@@ -2221,6 +2436,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
       if(!response.ok) {
         $('admin-password').value='';
         $('admin-password').placeholder='密码错误，请重试';
+        $('admin-password').focus();
         showToast('管理员密码错误','error');
         return;
       }
@@ -2235,6 +2451,7 @@ http.createServer(serve).listen(PORT,'0.0.0.0',()=>{
     $('mobile-channel-select').addEventListener('change',e=>switchChannel(e.target.value));
     $('user-search').addEventListener('input',renderUsers);
     $('admin-ban-button').addEventListener('click',()=>setIpBan($('admin-ban-ip').value.trim(),true));
+    $('admin-settings-save').addEventListener('click',saveAdminSettings);
     setInterval(tick,1000);
     tick();
     poll();
