@@ -8,9 +8,9 @@ $projectRoot = $PSScriptRoot
 $requiredMajor = 26
 $nodePath = $null
 $toolsDir = Join-Path $projectRoot '.build-tools'
-$outputName = if ($env:VOID_CHAT_EXE_NAME) { $env:VOID_CHAT_EXE_NAME } else { 'VOID-Chat.exe' }
+$outputName = if ($env:LAN_CHAT_EXE_NAME) { $env:LAN_CHAT_EXE_NAME } else { 'LAN-Chat.exe' }
 if ($outputName -notmatch '^[A-Za-z0-9._-]+\.exe$') {
-  throw 'VOID_CHAT_EXE_NAME must be a safe .exe file name.'
+  throw 'LAN_CHAT_EXE_NAME must be a safe .exe file name.'
 }
 $buildDir = Join-Path $projectRoot 'build'
 $distDir = Join-Path $projectRoot 'dist'
@@ -115,5 +115,9 @@ if (-not $SkipCompression) {
   Write-Host ("Final size: {0:N1} MB (compression skipped)" -f ($sizeAfter / 1MB))
 }
 
+if (Test-Path -LiteralPath $rawOutputPath) {
+  Remove-Item -LiteralPath $rawOutputPath -Force
+}
+
 Write-Host ''
-Write-Host 'Done. End users only need dist\VOID-Chat.exe and do not need Node.js.'
+Write-Host 'Done. End users only need dist\LAN-Chat.exe and do not need Node.js.'
