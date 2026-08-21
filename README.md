@@ -6,10 +6,6 @@ LAN-Chat 是一个轻量级的局域网匿名聊天项目。服务端、网页�
 
 项目还可以构建为 Windows 单文件程序。普通用户只需运行 `LAN-Chat.exe`，不需要安装 Node.js、npm 或其他运行环境。
 
-![f945d23197412664299f67f6572ecc9d](C:\Users\a1005\Desktop\LAN-Chat\image\f945d23197412664299f67f6572ecc9d.png)
-
-<img src="C:\Users\a1005\Desktop\LAN-Chat\image\de401ce8f9fa007ddfb1749836f0211f.jpg" alt="de401ce8f9fa007ddfb1749836f0211f" style="zoom: 33%;" />
-
 ## 功能介绍
 
 ### 聊天功能
