@@ -8,6 +8,8 @@ LAN-Chat 是一个轻量级的局域网匿名聊天项目。服务端、网页�
 
 ![f945d23197412664299f67f6572ecc9d](C:\Users\a1005\xwechat_files\wxid_ukb7xn8w9bx822_ff97\temp\RWTemp\2026-08\147ae5d2187378cae221e19a8cedfc67\f945d23197412664299f67f6572ecc9d.png)
 
+<img src="C:\Users\a1005\xwechat_files\wxid_ukb7xn8w9bx822_ff97\temp\RWTemp\2026-08\147ae5d2187378cae221e19a8cedfc67\de401ce8f9fa007ddfb1749836f0211f.jpg" alt="de401ce8f9fa007ddfb1749836f0211f" style="zoom: 33%;" />
+
 ## 功能介绍
 
 ### 聊天功能
