@@ -4,7 +4,7 @@ LAN-Chat 是一个轻量级的局域网匿名聊天项目。服务端、网页�
 
 项目适合在家庭、宿舍、办公室、教室或临时活动现场使用。同一局域网内的用户通过浏览器访问服务地址，即可进入公共频道或发起一对一私聊。
 
-项目还可以构建为 Windows 单文件程序。普通用户只需运行 `LAN-Chat.exe`，不需要安装 Node.js、npm 或其他运行环境。
+项目还可以构建为 Windows 单文件程序。普通用户只需运行 `LAN CHAT.exe`，不需要安装 Node.js、npm 或其他运行环境。
 
 ## 功能介绍
 
@@ -93,7 +93,7 @@ LAN-Chat 是一个轻量级的局域网匿名聊天项目。服务端、网页�
 下载，双击运行：
 
 ```text
-LAN-Chat.exe
+LAN CHAT.exe
 ```
 
 启动后控制台会显示访问地址，例如：
@@ -170,7 +170,7 @@ node .\server.js
 ```powershell
 $env:LAN_CHAT_PORT = "8080"
 $env:ADMIN_PASSWORD = "请设置一个强密码"
-.\dist\LAN-Chat.exe
+.\dist\LAN CHAT.exe
 ```
 
 | 环境变量 | 默认值 | 说明 |
@@ -189,12 +189,12 @@ $env:ADMIN_PASSWORD = "请设置一个强密码"
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
 ```
 
-必须运行上面的 PowerShell 入口，不要直接执行 `node .\tools\build-exe.js`。控制台显示约 `94 MB` 时只是原始 Node SEA，继续等待出现 `Final size` 和 `Done`；此时 `dist\LAN-Chat.exe` 才是约 `23 MB` 的最终压缩版。
+必须运行上面的 PowerShell 入口，不要直接执行 `node .\tools\build-exe.js`。控制台显示约 `94 MB` 时只是原始 Node SEA，继续等待出现 `Final size` 和 `Done`；此时 `dist\LAN CHAT.exe` 才是约 `23 MB` 的最终压缩版。
 
 构建成功后生成：
 
 ```text
-dist\LAN-Chat.exe
+dist\LAN CHAT.exe
 ```
 
 当前 Windows x64 构建实测由约 `93.8 MB` 压缩到约 `23.2 MB`，具体体积会随 Node.js 和 UPX 版本变化。
@@ -220,7 +220,7 @@ LAN-Chat/
 ├─ tools/
 │  └─ build-exe.js    # Node SEA 构建逻辑
 ├─ dist/
-│  └─ LAN-Chat.exe    # 构建后的单文件程序
+│  └─ LAN CHAT.exe    # 构建后的单文件程序
 ├─ EXE构建说明.md     # EXE 构建补充说明
 └─ README.md          # 项目文档
 ```
@@ -270,7 +270,7 @@ LAN-Chat/
 如果局域网内其他设备无法访问，请检查：
 
 1. 设备是否连接到同一个局域网。
-2. Windows 防火墙是否允许 `LAN-Chat.exe` 或 Node.js 通过专用网络。
+2. Windows 防火墙是否允许 `LAN CHAT.exe` 或 Node.js 通过专用网络。
 3. 服务端和访问端之间是否存在 AP 隔离、访客网络隔离或路由器访问限制。
 4. `9000` 端口是否已被其他程序占用；必要时可通过 `LAN_CHAT_PORT` 更换端口。
 

@@ -564,12 +564,12 @@ h1{margin:13px 0 14px;font-size:clamp(34px,3vw,48px);line-height:1.02;font-weigh
 .file-download{grid-area:download;min-width:54px;height:32px;padding:0 10px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--ink);border-radius:8px;background:var(--white);color:var(--ink);font:700 11px var(--font);text-decoration:none}
 .file-download:hover{background:var(--dark);color:var(--white)}
 .message-footer{position:absolute;left:8px;right:8px;bottom:6px;display:flex;align-items:center}
-.message-action{flex:1 1 0;width:auto;min-width:0;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);box-shadow:none;font:14px/1 var(--font)}
+.message-action{flex:0 0 24px;width:24px;min-width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);box-shadow:none;font:14px/1 var(--font)}
 .message-action:hover{transform:none;box-shadow:none;background:#dde4dc;color:var(--ink)}
 .message-action:disabled{visibility:hidden}
 .message-footer .message-action[hidden]{display:block;visibility:hidden}
 .message.recalled .message-bubble{background:#ecefeb;border-style:dashed;box-shadow:none;color:var(--muted);font-style:italic}
-.message-time{flex:1 1 0;color:#718078;font:700 11px var(--font);line-height:24px;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:center}
+.message-time{flex:1 1 auto;min-width:0;color:#718078;font:700 11px var(--font);line-height:24px;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:center}
 .message.self{grid-template-columns:minmax(0,1fr) 38px;grid-template-areas:'meta avatar' 'bubble avatar';justify-items:end;margin-left:auto}
 .message.self .message-meta{flex-direction:row-reverse}
 .message.self .message-name{color:#2d6a4f}

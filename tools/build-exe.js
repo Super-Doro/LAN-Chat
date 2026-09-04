@@ -8,8 +8,8 @@ const buildDir = path.join(root, 'build');
 const pagePath = path.join(buildDir, 'page.html');
 const mainPath = path.join(buildDir, 'server.sea.js');
 const configPath = path.join(buildDir, 'sea-config.json');
-const requestedOutputName = String(process.env.LAN_CHAT_EXE_NAME || 'LAN-Chat.exe');
-if (!/^[A-Za-z0-9._-]+\.exe$/i.test(requestedOutputName)) throw new Error('LAN_CHAT_EXE_NAME 必须是安全的 .exe 文件名');
+const requestedOutputName = String(process.env.LAN_CHAT_EXE_NAME || 'LAN CHAT.exe');
+if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]*\.exe$/i.test(requestedOutputName)) throw new Error('LAN_CHAT_EXE_NAME 必须是安全的 .exe 文件名');
 const rawOutputName = `${path.parse(requestedOutputName).name}.raw.exe`;
 const outputPath = path.join(buildDir, rawOutputName);
 
@@ -50,4 +50,3 @@ for (const temporary of [pagePath,mainPath,configPath]) fs.rmSync(temporary,{for
 const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
 console.log(`\n原始 SEA 已生成（尚未压缩）: ${outputPath}`);
 console.log(`原始运行时大小: ${sizeMb} MB`);
-console.log('请等待 build-exe.ps1 完成 UPX 压缩；看到 Final size 和 Done 才表示最终构建完成。');

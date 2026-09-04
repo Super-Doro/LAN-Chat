@@ -6,12 +6,12 @@
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
 ```
 
-不要直接运行 `node .\tools\build-exe.js`，它只负责生成约 `94 MB` 的原始 SEA。请等待 PowerShell 输出 `Final size` 和 `Done`，之后 `dist\LAN-Chat.exe` 才是约 `23 MB` 的最终压缩版。
+不要直接运行 `node .\tools\build-exe.js`，它只负责生成约 `94 MB` 的原始 SEA。构建脚本会在 PowerShell 中输出 `0%` 到 `100%` 的阶段进度；请等待输出 `Build completed` 和 `Done`，之后 `dist\LAN CHAT.exe` 才是约 `23 MB` 的最终压缩版。UPX 压缩阶段的百分比表示构建阶段，不是文件字节级精确进度。
 
 构建成功后会生成：
 
 ```text
-dist\LAN-Chat.exe
+dist\LAN CHAT.exe
 ```
 
 当前 Windows x64 构建实测由约 `93.8 MB` 压缩到约 `23.2 MB`，具体体积会随 Node.js 和 UPX 版本变化。
@@ -24,7 +24,7 @@ dist\LAN-Chat.exe
 powershell -ExecutionPolicy Bypass -File .\build-exe.ps1 -SkipCompression
 ```
 
-双击 `LAN-Chat.exe` 后，控制台会显示本机和局域网访问地址。关闭控制台窗口即可停止聊天服务。
+双击 `LAN CHAT.exe` 后，控制台会显示本机和局域网访问地址。关闭控制台窗口即可停止聊天服务。
 
 ## 当前聊天功能
 
