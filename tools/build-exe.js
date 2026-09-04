@@ -8,7 +8,7 @@ const buildDir = path.join(root, 'build');
 const pagePath = path.join(buildDir, 'page.html');
 const mainPath = path.join(buildDir, 'server.sea.js');
 const configPath = path.join(buildDir, 'sea-config.json');
-const requestedOutputName = String(process.env.LAN_CHAT_EXE_NAME || 'LAN CHAT.exe');
+const requestedOutputName = String(process.env.LAN_CHAT_EXE_NAME || 'LAN_CHAT.exe');
 if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]*\.exe$/i.test(requestedOutputName)) throw new Error('LAN_CHAT_EXE_NAME 必须是安全的 .exe 文件名');
 const rawOutputName = `${path.parse(requestedOutputName).name}.raw.exe`;
 const outputPath = path.join(buildDir, rawOutputName);
