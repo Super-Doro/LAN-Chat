@@ -21,7 +21,7 @@ const PAGE = (() => {
   return start<0||end<=start?'<!doctype html><html lang="zh-CN"><body><h1>页面加载失败</h1></body></html>':source.slice(start+'/* PAGE_START'.length,end).trimStart();
 })();
 const PAGE_GZIP=zlib.gzipSync(PAGE,{level:9});
-const DEFAULT_RETENTION_MS = 5 * 60 * 1000;
+const DEFAULT_RETENTION_MS = 10 * 60 * 1000;
 const MIN_RETENTION_MINUTES = 1;
 const MAX_RETENTION_MINUTES = 24 * 60;
 const MAX_MESSAGES = 1000;
@@ -31,6 +31,7 @@ const MAX_BODY_BYTES = 16 * 1024;
 const DEFAULT_MAX_FILE_BYTES = 1024 * 1024;
 const MIN_FILE_MEGABYTES = 1;
 const MAX_FILE_MEGABYTES = 20 * 1024;
+const MAX_IMAGE_PREVIEW_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_DURATION_MS = 12 * 60 * 60 * 1000;
 const UPLOAD_CHUNK_BYTES = 1024 * 1024;
 const UPLOAD_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -42,13 +43,6 @@ const MAX_CONNECTIONS_PER_IP = 1;
 const SEND_WINDOW_MS = 5000;
 const SEND_WINDOW_LIMIT = 2;
 const RECALL_WINDOW_MS = 3 * 60 * 1000;
-const CONFIG_DIR = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA,'LAN-Chat') : path.join(os.homedir(),'.lan-chat');
-const CONFIG_FILE = path.join(CONFIG_DIR,'config.json');
-function loadPersistentConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE,'utf8')); }
-  catch { return {}; }
-}
-const persistentConfig=loadPersistentConfig();
 const FILE_DIR = path.join(os.tmpdir(), 'lan-chat-files');
 fs.mkdirSync(FILE_DIR,{recursive:true});
 const defaultChannels = [
@@ -58,8 +52,7 @@ const defaultChannels = [
   { id: 'channel4', name: '频道4' },
   { id: 'channel5', name: '频道5' }
 ];
-const savedChannelNames=persistentConfig.channels&&typeof persistentConfig.channels==='object'?persistentConfig.channels:{};
-const channels = defaultChannels.map(channel=>({id:channel.id,name:Array.from(String(savedChannelNames[channel.id]||channel.name).trim()).slice(0,10).join('')||channel.name}));
+const channels = defaultChannels.map(channel=>({...channel}));
 const messages = new Map(channels.map(channel => [channel.id, []]));
 const privateMessages = new Map();
 const clients = new Map();
@@ -70,23 +63,10 @@ const ownedFileIds = new Set();
 const activeUploadIds = new Set();
 const uploadSessions = new Map();
 const rtcSignals = new Map();
-const savedRetentionMs=Number(persistentConfig.retentionMs);
-const savedRetentionMinutes=savedRetentionMs/(60*1000);
-const savedMaxFileBytes=Number(persistentConfig.maxFileBytes);
-const savedFileMegabytes=savedMaxFileBytes/(1024*1024);
-let retentionMs = Number.isInteger(savedRetentionMinutes)&&savedRetentionMinutes>=MIN_RETENTION_MINUTES&&savedRetentionMinutes<=MAX_RETENTION_MINUTES?savedRetentionMs:DEFAULT_RETENTION_MS;
-let maxFileBytes = Number.isInteger(savedFileMegabytes)&&savedFileMegabytes>=MIN_FILE_MEGABYTES&&savedFileMegabytes<=MAX_FILE_MEGABYTES?savedMaxFileBytes:DEFAULT_MAX_FILE_BYTES;
+let retentionMs = DEFAULT_RETENTION_MS;
+let maxFileBytes = DEFAULT_MAX_FILE_BYTES;
 const localAddresses = new Set(['127.0.0.1','::1',...Object.values(os.networkInterfaces()).flat().filter(Boolean).map(item=>item.address)]);
-for(const item of Array.isArray(persistentConfig.bans)?persistentConfig.bans:[]) {
-  const ip=String(item?.ip||''); const at=Number(item?.at)||Date.now();
-  if(net.isIP(ip)&&!localAddresses.has(ip)) bannedIps.set(ip,{at});
-}
-function persistConfig() {
-  try {
-    fs.mkdirSync(CONFIG_DIR,{recursive:true});
-    fs.writeFileSync(CONFIG_FILE,JSON.stringify({version:1,channels:Object.fromEntries(channels.map(channel=>[channel.id,channel.name])),retentionMs,maxFileBytes,bans:banList()},null,2),'utf8');
-  } catch(error) { console.warn(`Unable to save configuration: ${error.message}`); }
-}
+function persistConfig() {}
 const defaultNames = ['雾中信号','午夜电台','路过的人','蓝色回声','未读消息','七号窗口','风的背面','纸上月光','无名之声','半格电量','雨后电台','凌晨三点','玻璃海岸','远方来客','静默频道','白噪音','南墙以北','小行星带','旧磁带','临时月亮','低空飞行','纸船渡口','橘色回声','没有署名','第九街角','慢速星球','失眠旅人','空白信笺','北纬三十','候车室里','微光入口','借过一下','晴天留声机','倒带之前','未完句号','晚风收件箱','路灯下面','隐身模式','落日存档','匿名观测员','月面漫步者','雨伞借我','发呆俱乐部','半夜醒来','蓝调星期五','海边的字','轻声路过','没有目的地','风筝线外','借来的名字'];
 let cursor = 0;
 
@@ -107,6 +87,15 @@ function privateUnreadFor(clientId) {
   for(const thread of privateMessages.values()) for(const message of thread) {
     if(message.recipientId!==clientId||message.recalled||message.cursor<=(read.get(message.senderId)||0)) continue;
     counts[message.senderId]=(counts[message.senderId]||0)+1;
+  }
+  return counts;
+}
+function channelUnreadFor(clientId) {
+  const client=clients.get(clientId); const read=client?.channelRead||new Map(); const counts={};
+  for(const channel of channels) {
+    let count=0;
+    for(const message of messages.get(channel.id)||[]) if(!message.recalled&&message.senderId!==clientId&&(message.createdCursor||message.cursor)>(read.get(channel.id)||0)) count++;
+    counts[channel.id]=count;
   }
   return counts;
 }
@@ -154,6 +143,13 @@ function safeFileName(raw) {
   const base=path.basename(decoded).replace(/[\x00-\x1f<>:"/\\|?*]/g,'_').trim();
   return Array.from(base).slice(0,120).join('');
 }
+function previewImageType(file) {
+  const declared=String(file?.type||'').toLowerCase().split(';')[0].trim();
+  const allowed=new Set(['image/jpeg','image/png','image/gif','image/webp','image/avif','image/bmp']);
+  if(allowed.has(declared)) return declared;
+  const extension=path.extname(String(file?.name||'')).toLowerCase();
+  return ({'.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.avif':'image/avif','.bmp':'image/bmp'})[extension]||'';
+}
 function readBinary(req,maxBytes) {
   return new Promise((resolve,reject)=>{
     const chunks=[]; let size=0; let settled=false;
@@ -185,6 +181,15 @@ function uploadTarget(data) {
   const channelId=getChannel(String(data.channel||''));
   return {peerId,channelId,mode:peerId?'private':'channel'};
 }
+function replySnapshot(items,rawId) {
+  const id=String(rawId||'');
+  if(!id) return null;
+  if(!/^[0-9a-f-]{36}$/i.test(id)) return undefined;
+  const target=items.find(message=>message.id===id);
+  if(!target||target.recalled) return undefined;
+  const preview=target.file?'[文件] '+target.file.name:Array.from(String(target.text||'')).slice(0,120).join('');
+  return {id:target.id,name:target.name||'匿名用户',preview};
+}
 async function initializeUpload(req,res) {
   let data;
   try { data=await body(req); } catch(error) { return json(res,error.message==='body too large'?413:400,{error:error.message==='body too large'?'body too large':'invalid'}); }
@@ -205,12 +210,15 @@ async function initializeUpload(req,res) {
     resumable.updatedAt=now;
     return json(res,200,{uploadId:resumable.id,chunkBytes:UPLOAD_CHUNK_BYTES,received:resumable.received,size:resumable.size,resumed:resumable.received>0});
   }
+  const targetMessages=mode==='private'?getPrivateMessages(clientId,peerId):messages.get(channelId);
+  const reply=replySnapshot(targetMessages,String(data.replyTo||''));
+  if(reply===undefined) return json(res,400,{error:'invalid reply'});
   const previous=[...uploadSessions.values()].filter(session=>session.clientId===clientId);
   await Promise.all(previous.map(discardUpload));
   const slot=reserveSendSlot(sender,now);
   if(slot.retryAfter) return json(res,429,{error:'rate limit',retryAfter:slot.retryAfter});
   clients.set(clientId,{...sender,lastSeen:now,sentAt:slot.sentAt});
-  const id=crypto.randomUUID(); const session={id,clientId,peerId,channelId,mode,name,size,type,fingerprint,received:0,createdAt:now,updatedAt:now,locked:false,cancelled:false};
+  const id=crypto.randomUUID(); const session={id,clientId,peerId,channelId,mode,name,size,type,fingerprint,reply,received:0,createdAt:now,updatedAt:now,locked:false,cancelled:false};
   try { await fs.promises.writeFile(filePath(id),Buffer.alloc(0),{flag:'wx'}); }
   catch { return json(res,500,{error:'upload init failed'}); }
   ownedFileIds.add(id); uploadSessions.set(id,session);
@@ -263,8 +271,8 @@ async function completeUpload(req,res,uploadId) {
     if(session.peerId&&!clients.has(session.peerId)) return json(res,404,{error:'peer offline'});
     const currentSender=clients.get(clientId); if(!currentSender||currentSender.ip!==ip) return json(res,403,{error:'not connected'});
     if(!session.peerId&&currentSender.channel!==session.channelId) return json(res,409,{error:'channel changed'});
-    const completedAt=Date.now(); const downloadToken=crypto.randomBytes(24).toString('hex');
-    const message={id:crypto.randomUUID(),cursor:++cursor,at:completedAt,mode:session.mode,channel:session.mode==='private'?'private':session.channelId,senderId:clientId,recipientId:session.peerId||'',name:reservedNames.get(clientId)||currentSender.name||'匿名用户',text:'',file:{id:uploadId,name:session.name,size:session.size,type:session.type,token:downloadToken,sha256},deliveredAt:null,readAt:null,recalled:false};
+    const completedAt=Date.now(); const downloadToken=crypto.randomBytes(24).toString('hex'); const messageCursor=++cursor;
+    const message={id:crypto.randomUUID(),cursor:messageCursor,createdCursor:messageCursor,at:completedAt,mode:session.mode,channel:session.mode==='private'?'private':session.channelId,senderId:clientId,recipientId:session.peerId||'',name:reservedNames.get(clientId)||currentSender.name||'匿名用户',text:'',file:{id:uploadId,name:session.name,size:session.size,type:session.type,token:downloadToken,sha256},reply:session.reply||null,deliveredAt:null,readAt:null,recalled:false};
     const targetMessages=session.mode==='private'?getPrivateMessages(clientId,session.peerId,true):messages.get(session.channelId);
     targetMessages.push(message);
     if(targetMessages.length>MAX_MESSAGES) targetMessages.splice(0,targetMessages.length-MAX_MESSAGES).forEach(deleteMessageFile);
@@ -286,6 +294,11 @@ function findFileMessage(fileId) {
   for(const thread of privateMessages.values()) { const message=thread.find(item=>item.file?.id===fileId); if(message) return message; }
   return null;
 }
+function findMessageById(messageId) {
+  for(const channelMessages of messages.values()) { const message=channelMessages.find(item=>item.id===messageId); if(message) return message; }
+  for(const thread of privateMessages.values()) { const message=thread.find(item=>item.id===messageId); if(message) return message; }
+  return null;
+}
 async function sendFile(req,res,url) {
   const match=url.pathname.match(/^\/api\/file\/([0-9a-f-]{36})$/i);
   if(!match) { json(res,404,{error:'not found'}); return true; }
@@ -300,12 +313,13 @@ async function sendFile(req,res,url) {
   let stat;
   try { stat=await fs.promises.stat(filePath(fileId)); } catch { json(res,410,{error:'file expired'}); return true; }
   const encoded=encodeURIComponent(message.file.name).replace(/['()*]/g,char=>'%'+char.charCodeAt(0).toString(16).toUpperCase());
-  res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Length':stat.size,'Content-Disposition':`attachment; filename*=UTF-8''${encoded}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});
+  const imageType=previewImageType(message.file); const inlinePreview=url.searchParams.get('preview')==='1'&&!!imageType&&stat.size<=MAX_IMAGE_PREVIEW_BYTES;
+  res.writeHead(200,{'Content-Type':inlinePreview?imageType:'application/octet-stream','Content-Length':stat.size,'Content-Disposition':`${inlinePreview?'inline':'attachment'}; filename*=UTF-8''${encoded}`,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'});
   const stream=fs.createReadStream(filePath(fileId)); stream.on('error',()=>res.destroy()); stream.pipe(res); return true;
 }
 function serve(req,res) {
   const url = new URL(req.url, 'http://localhost');
-  if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{canAdmin:isLocalRequest(req),limit:MAX_CONNECTIONS,retentionMs,maxFileBytes});
+  if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{canAdmin:isLocalRequest(req),limit:MAX_CONNECTIONS,retentionMs,maxFileBytes,maxImagePreviewBytes:MAX_IMAGE_PREVIEW_BYTES});
   if (req.method==='POST' && url.pathname==='/api/admin/login') return body(req).then(data => { if(!isLocalRequest(req)) return json(res,403,{error:'local only'}); if(String(data.password||'')!==ADMIN_PASSWORD) return json(res,401,{error:'wrong password'}); const token=crypto.randomBytes(24).toString('hex'); adminTokens.set(token,{ip:requestIp(req),expiresAt:Date.now()+60*60*1000}); json(res,200,{token}); }).catch(error=>json(res,error.message==='body too large'?413:400,{error:error.message==='body too large'?'body too large':'invalid'}));
   if (req.method==='POST' && url.pathname==='/api/admin/channel') return body(req).then(data => { if(!getAdmin(req)) return json(res,403,{error:'admin required'}); const channel=channels.find(item=>item.id===data.id); const name=Array.from(String(data.name||'').trim()).slice(0,10).join(''); if(!channel||!name) return json(res,400,{error:'invalid channel'}); channel.name=name; persistConfig(); json(res,200,{channels}); }).catch(()=>json(res,400,{error:'invalid'}));
   if (req.method==='POST' && url.pathname==='/api/admin/settings') return body(req).then(data => {
@@ -352,11 +366,14 @@ function serve(req,res) {
     if(!sender||sender.ip!==ip||!clients.has(peerId)||peerId===clientId||!/^[a-z0-9-]{16,64}$/i.test(transferId)) return json(res,403,{error:'invalid direct transfer'});
     if(!Number.isInteger(size)||size<=0||size>maxFileBytes||!/^[0-9a-f]{64}$/.test(sha256)) return json(res,400,{error:'invalid direct file'});
     const name=safeFileName(data.name); if(!name) return json(res,400,{error:'invalid file name'});
+    const thread=getPrivateMessages(clientId,peerId,true); const reply=replySnapshot(thread,String(data.replyTo||''));
+    if(reply===undefined) return json(res,400,{error:'invalid reply'});
     const slot=reserveSendSlot(sender,now); if(slot.retryAfter) return json(res,429,{error:'rate limit',retryAfter:slot.retryAfter});
     clients.set(clientId,{...sender,lastSeen:now,sentAt:slot.sentAt});
     const type=String(data.type||'application/octet-stream').replace(/[\r\n]/g,'').slice(0,100)||'application/octet-stream';
-    const message={id:crypto.randomUUID(),cursor:++cursor,at:now,mode:'private',channel:'private',senderId:clientId,recipientId:peerId,name:reservedNames.get(clientId)||sender.name||'匿名用户',text:'',file:{id:transferId,transferId,name,size,type,direct:true,sha256,receivedAt:now},deliveredAt:now,readAt:null,recalled:false};
-    const thread=getPrivateMessages(clientId,peerId,true); thread.push(message); if(thread.length>MAX_MESSAGES) thread.splice(0,thread.length-MAX_MESSAGES).forEach(deleteMessageFile);
+    const messageCursor=++cursor;
+    const message={id:crypto.randomUUID(),cursor:messageCursor,createdCursor:messageCursor,at:now,mode:'private',channel:'private',senderId:clientId,recipientId:peerId,name:reservedNames.get(clientId)||sender.name||'匿名用户',text:'',file:{id:transferId,transferId,name,size,type,direct:true,sha256,receivedAt:now},reply,deliveredAt:now,readAt:null,recalled:false};
+    thread.push(message); if(thread.length>MAX_MESSAGES) thread.splice(0,thread.length-MAX_MESSAGES).forEach(deleteMessageFile);
     json(res,201,{ok:true,message});
   }).catch(error=>json(res,error.message==='body too large'?413:400,{error:'invalid'}));
   if (req.method==='GET' && url.pathname.startsWith('/api/file/')) return sendFile(req,res,url).catch(()=>{ if(!res.headersSent) json(res,500,{error:'download failed'}); });
@@ -375,10 +392,15 @@ function serve(req,res) {
     if(!isExisting && clients.size>=MAX_CONNECTIONS) return json(res,429,{error:'room full',limit:MAX_CONNECTIONS,retryAfter:BLOCK_HINT,online:clients.size,onlineByChannel:onlineByChannel(now),channels});
     const assignedName=allocateName(client,url.searchParams.get('name')||'');
     const privateRead=existing?.privateRead||new Map();
-    clients.set(client,{...existing,lastSeen:now,channel,ip,name:assignedName,sentAt:existing?.sentAt||[],privateRead});
+    const channelRead=existing?.channelRead||new Map(channels.map(item=>[item.id,cursor]));
+    clients.set(client,{...existing,lastSeen:now,channel,ip,name:assignedName,sentAt:existing?.sentAt||[],privateRead,channelRead});
     const since=Number(url.searchParams.get('since')) || 0;
     pruneMessages(now);
     let activeMessages=messages.get(channel);
+    if(!peer) {
+      const newestChannelMessage=activeMessages.reduce((latest,message)=>Math.max(latest,message.createdCursor||message.cursor||0),0);
+      if(newestChannelMessage) channelRead.set(channel,Math.max(channelRead.get(channel)||0,newestChannelMessage));
+    }
     let peerInfo=null;
     if(peer) {
       activeMessages=getPrivateMessages(client,peer);
@@ -394,7 +416,7 @@ function serve(req,res) {
       peerInfo={id:peer,name:reservedNames.get(peer)||peerRecord?.name||'已离线用户',online:!!peerRecord};
     }
     const typing=[...clients.entries()].filter(([id,item])=>id!==client&&item.typingUntil>now&&(peer?(id===peer&&item.typingMode==='private'&&item.typingPeer===client):(item.typingMode==='channel'&&item.typingChannel===channel))).map(([id,item])=>reservedNames.get(id)||item.name||'匿名用户');
-    return json(res,200,{cursor,messages:activeMessages.filter(m=>m.cursor>since),mode:peer?'private':'channel',peer:peerInfo,typing,rtcSignals:takeRtcSignals(client,now),privateUnread:privateUnreadFor(client),privateActivity:privateActivityFor(client),online:clients.size,onlineByChannel:onlineByChannel(now),users:onlineUsers(now),channels,retentionMs,recallWindowMs:RECALL_WINDOW_MS,maxFileBytes,assignedName,limit:MAX_CONNECTIONS,renderBatch:RENDER_BATCH,pollInterval:POLL_HINT});
+    return json(res,200,{cursor,messages:activeMessages.filter(m=>m.cursor>since),mode:peer?'private':'channel',peer:peerInfo,typing,rtcSignals:takeRtcSignals(client,now),privateUnread:privateUnreadFor(client),channelUnread:channelUnreadFor(client),privateActivity:privateActivityFor(client),online:clients.size,onlineByChannel:onlineByChannel(now),users:onlineUsers(now),channels,retentionMs,recallWindowMs:RECALL_WINDOW_MS,maxFileBytes,maxImagePreviewBytes:MAX_IMAGE_PREVIEW_BYTES,assignedName,limit:MAX_CONNECTIONS,renderBatch:RENDER_BATCH,pollInterval:POLL_HINT});
   }
   if (req.method==='POST' && url.pathname==='/api/typing') return body(req).then(data=>{
     const clientId=String(data.id||''); const peer=String(data.peer||''); const channel=getChannel(data.channel); const mode=data.mode==='private'?'private':'channel'; const now=Date.now(); const ip=requestIp(req); const connected=clients.get(clientId);
@@ -413,12 +435,16 @@ function serve(req,res) {
     if(existing.ip!==ip) return json(res,403,{error:'invalid session'});
     if(isPrivate&&(!peer||peer===client||peer.length>128)) return json(res,400,{error:'invalid peer'});
     if(isPrivate&&!clients.has(peer)) return json(res,404,{error:'peer offline'});
+    const targetMessages=isPrivate?getPrivateMessages(client,peer,true):messages.get(channel);
+    const reply=replySnapshot(targetMessages,String(data.replyTo||''));
+    if(reply===undefined) return json(res,400,{error:'invalid reply'});
     const slot=reserveSendSlot(existing,now);
     if(slot.retryAfter) return json(res,429,{error:'rate limit',retryAfter:slot.retryAfter});
     const name=allocateName(client,data.name);
     clients.set(client,{...existing,lastSeen:now,channel,name,sentAt:slot.sentAt});
-    const message={id:crypto.randomUUID(),cursor:++cursor,at:now,mode:isPrivate?'private':'channel',channel:isPrivate?'private':channel,senderId:client,recipientId:isPrivate?peer:null,name,text:Array.from(data.text.trim()).slice(0,500).join(''),deliveredAt:null,readAt:null,recalled:false};
-    const targetMessages=isPrivate?getPrivateMessages(client,peer,true):messages.get(channel); targetMessages.push(message);
+    const messageCursor=++cursor;
+    const message={id:crypto.randomUUID(),cursor:messageCursor,createdCursor:messageCursor,at:now,mode:isPrivate?'private':'channel',channel:isPrivate?'private':channel,senderId:client,recipientId:isPrivate?peer:null,name,text:Array.from(data.text.trim()).slice(0,500).join(''),reply,deliveredAt:null,readAt:null,recalled:false};
+    targetMessages.push(message);
     if(targetMessages.length>MAX_MESSAGES) targetMessages.splice(0,targetMessages.length-MAX_MESSAGES);
     json(res,201,{ok:true,name,message});
   }).catch(error=>json(res,error.message==='body too large'?413:400,{error:error.message==='body too large'?'body too large':'invalid'}));
@@ -427,9 +453,7 @@ function serve(req,res) {
     if(isIpBanned(ip)) return json(res,403,{error:'ip banned'});
     const connected=clients.get(client);
     if(!connected||connected.ip!==ip) return json(res,403,{error:'not connected'});
-    let target=null;
-    for(const channelMessages of messages.values()) { target=channelMessages.find(message=>message.id===messageId); if(target) break; }
-    if(!target) for(const thread of privateMessages.values()) { target=thread.find(message=>message.id===messageId); if(target) break; }
+    const target=findMessageById(messageId);
     if(!target) return json(res,404,{error:'message not found'});
     if(target.senderId!==client) return json(res,403,{error:'not owner'});
     if(target.recalled) return json(res,409,{error:'already recalled'});
@@ -478,7 +502,7 @@ server.listen(PORT,'0.0.0.0',()=>{
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LAN Chat</title>
+  <title>LAN CHAT</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%23f8fcff'/%3E%3Cstop offset='1' stop-color='%23b9dcf6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='19' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%230a84ff'/%3E%3Cpath d='M21 22a14 14 0 0 0 0 20M16 17a21 21 0 0 0 0 30M43 22a14 14 0 0 1 0 20M48 17a21 21 0 0 1 0 30' fill='none' stroke='%230a84ff' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
   <style>
 :root{--ink:#17211b;--muted:#718078;--line:#d9e0d9;--paper:#eef1eb;--lime:#d9ff55;--coral:#ff7059;--white:#fffef9;--dark:#1c251f;--amber:#ffb347;--font:'Microsoft YaHei','PingFang SC',sans-serif}
@@ -1317,13 +1341,15 @@ main{gap:24px}
 .profile-panel,.room-panel{padding-top:24px}
 .chat{overflow:hidden}
 .chat-top,.messages{border:0!important;background:transparent!important}
-.composer{margin:0 24px 16px!important;padding:0!important;gap:10px!important;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.composer{margin:0 12px 16px!important;padding:0!important;gap:10px!important;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
 .composer:focus-within{border-color:transparent!important;box-shadow:none!important}
 #message{height:46px;min-height:46px;padding:0 4px!important;border:0!important;border-bottom:1px solid rgba(72,104,132,.35)!important;border-radius:0!important;background:transparent!important;box-shadow:none!important}
 #message:focus{border-bottom-color:var(--ios-blue)!important;box-shadow:none!important}
 #send{width:auto!important;min-width:auto!important;height:46px!important;padding:0 6px!important;color:var(--ios-blue)!important;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important}
 #send:hover,#send:active{transform:none!important;background:transparent!important;box-shadow:none!important}
 .emoji-toggle,.file-toggle{width:42px!important;min-width:42px!important;height:42px!important;padding:0!important;color:var(--ios-ink)!important;border:1px solid rgba(255,255,255,.9)!important;border-radius:19px!important;background:radial-gradient(circle at 22% 0%,rgba(255,255,255,.95),transparent 46%),linear-gradient(145deg,rgba(255,255,255,.72),rgba(226,239,251,.48))!important;box-shadow:0 7px 18px rgba(42,68,94,.11),inset 0 1px 1px #fff,inset 0 -1px 0 rgba(255,255,255,.3)!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.emoji-wrap{width:42px!important;min-width:42px!important;height:42px!important;flex:0 0 42px!important;display:grid;place-items:center}
+.emoji-toggle,.file-toggle{display:grid!important;place-items:center!important;box-sizing:border-box!important;aspect-ratio:1}
 .emoji-toggle .lucide,.file-toggle .lucide{color:var(--ios-blue)}
 .emoji-toggle:hover,.file-toggle:hover,.emoji-toggle[aria-expanded="true"]{color:var(--ios-blue)!important;border-color:#fff!important;background:radial-gradient(circle at 25% 0%,#fff,transparent 48%),linear-gradient(145deg,rgba(255,255,255,.86),rgba(222,239,254,.62))!important;box-shadow:0 9px 22px rgba(41,76,108,.14),inset 0 1px 1px #fff!important}
 .identity,.search-shell,.mobile-channel-select,.channel-button,.user-row,.metric,.rules{background-color:rgba(255,255,255,.16)!important}
@@ -1344,7 +1370,7 @@ html.performance-lite .message-bubble::before,html.performance-lite .transfer-ta
 .rules #retention-rule{color:inherit!important;font-weight:500!important}
 body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important;place-items:center;text-align:center}
 .chat{position:relative}
-.transfer-task{left:clamp(12px,2vw,24px)!important;right:clamp(12px,2vw,24px)!important;width:auto!important;max-width:calc(100% - clamp(24px,4vw,48px))!important;min-width:0;box-sizing:border-box}
+.transfer-task{position:absolute!important;z-index:16!important;left:clamp(12px,2vw,24px)!important;right:clamp(12px,2vw,24px)!important;width:auto!important;max-width:calc(100% - clamp(24px,4vw,48px))!important;min-width:0;box-sizing:border-box}
 .transfer-task-head,.transfer-task-head>div:first-child,.transfer-task-status,.transfer-task-track{min-width:0;max-width:100%}
 .transfer-task-status{overflow-wrap:anywhere}
 .transfer-task-progress{max-width:100%}
@@ -1356,7 +1382,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
 .admin-tools-layout{grid-template-columns:repeat(3,minmax(0,1fr))!important}.admin-tool-panel{overflow-wrap:anywhere}
 @media (max-width:900px){.admin-tools-layout{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
 @media (max-width:620px){.admin-tools-layout{grid-template-columns:minmax(0,1fr)!important}.admin-ban-tools{grid-column:auto!important}.modal,.modal.admin-modal-wide,.modal.admin-modal-wide.tools-open{max-width:calc(100vw - 20px);padding:clamp(14px,4vw,20px)}.admin-channel-row{grid-template-columns:64px minmax(0,1fr) 56px;gap:6px}.transfer-task{left:10px!important;right:10px!important;max-width:calc(100% - 20px)!important}.transfer-task-actions{gap:4px}.transfer-task-button{width:34px;min-width:34px;height:34px}}
-@media (max-width:700px){main{gap:0}header{padding:0 12px!important}.profile-panel{padding-top:16px}.room-panel{padding-top:18px}.composer{margin:0 12px 12px!important}.emoji-wrap,#send,.file-toggle{width:42px!important;min-width:42px!important;max-width:42px!important;flex-basis:42px!important}#send{padding:0!important}#send .send-label{display:none}body.mobile-users-open .profile-panel{border:0!important;border-radius:0!important;background:rgba(235,246,255,.8)!important;backdrop-filter:blur(18px)!important;-webkit-backdrop-filter:blur(18px)!important}}
+@media (max-width:700px){main{gap:0;grid-template-rows:minmax(0,1fr)!important}header{padding:0 12px!important}main>.profile-panel{display:none}.room-panel{padding-top:18px}.chat{grid-template-rows:52px minmax(0,1fr) 72px}.chat-top{grid-template-columns:minmax(0,1fr) minmax(0,1.12fr) 58px!important;gap:6px!important;padding:0 10px!important}.mobile-channel-select{height:38px!important;padding:0 8px!important;font-size:11px}.mobile-users-toggle{width:58px!important;max-width:58px!important;height:38px!important;padding:0 5px!important;font-size:11px}.composer{margin:0 8px 12px!important}.emoji-wrap,#send,.file-toggle{width:42px!important;min-width:42px!important;max-width:42px!important;flex-basis:42px!important}#send{padding:0!important}#send .send-label{display:none}body.mobile-users-open main>.profile-panel{display:flex}body.mobile-users-open .profile-panel{border:0!important;border-radius:0!important;background:rgba(235,246,255,.8)!important;backdrop-filter:blur(18px)!important;-webkit-backdrop-filter:blur(18px)!important}}
 :where(.modal,.admin-tool-panel,.admin-tools-layout,.admin-channels,.admin-settings,.admin-ban-tools,.banned-list,.banned-row,.admin-ban-entry,.message,.message-bubble,.message-file,.file-download,.emoji-panel,.toast-message,.transfer-task,.blocker-card){min-width:0;max-width:100%;box-sizing:border-box}
 .admin-tool-panel{overflow:hidden}.admin-tools-layout{width:100%}
 .admin-tool-panel{contain:layout style;border-color:transparent!important;background:transparent!important;box-shadow:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
@@ -1371,6 +1397,25 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
 .user-admin-button:hover,.user-admin-button:active{color:var(--ios-blue)!important;background:transparent!important;box-shadow:none!important;transform:none!important}
 .user-admin-button:focus-visible{outline:2px solid rgba(10,132,255,.45);outline-offset:-5px}
 @media (max-width:420px){.banned-row{grid-template-columns:minmax(0,1fr) 52px}.banned-row button{width:52px;min-width:52px}.admin-ban-entry{grid-template-columns:minmax(0,1fr) 62px}.admin-ban-entry button{padding:0 6px}#admin-tools>.modal-actions button{min-width:72px;height:34px;padding:0 12px}}
+.chat-top>.identity{display:none}
+@media (max-width:700px){.chat-top>.identity{width:auto!important;min-width:0;height:38px;margin:0!important;padding:0!important;display:grid;grid-template-columns:28px minmax(0,1fr);gap:5px;align-items:center;overflow:visible!important}.chat-top>.identity .avatar{width:28px;height:28px;border-radius:10px!important;font-size:11px!important}.chat-top>.identity>div:last-child{min-width:0;display:block}.chat-top>.identity small{display:none}.chat-top>.identity input{width:100%;min-width:0;height:38px;padding:0 8px;color:var(--ios-ink);border:1px solid rgba(255,255,255,.76);border-radius:15px;background:rgba(255,255,255,.43);box-shadow:inset 0 1px 1px rgba(255,255,255,.92);font-family:var(--font);font-size:12px;font-weight:600;caret-color:var(--ios-blue)}.chat-top>.identity input:focus{outline:none;border-color:rgba(10,132,255,.55);box-shadow:0 0 0 3px rgba(10,132,255,.1),inset 0 1px 1px #fff}}
+.rules{display:grid;gap:11px;padding-top:17px!important;color:var(--ios-secondary)!important;font:11px/1.55 var(--font)!important;letter-spacing:0!important}
+.rules-title{display:flex;align-items:center;gap:7px;color:var(--ios-ink);font-size:12px;font-weight:750;letter-spacing:.08em}
+.rules-title .lucide{width:15px;height:15px;color:var(--ios-blue);stroke-width:2}
+.rules-list{display:grid;gap:7px;margin:0;padding:0;list-style:none}
+.rules-list li{position:relative;margin:0;padding-left:13px;overflow-wrap:anywhere}
+.rules-list li::before{content:'';position:absolute;left:0;top:.62em;width:4px;height:4px;border-radius:50%;background:var(--ios-blue);box-shadow:0 0 0 3px rgba(10,132,255,.08)}
+.rules-list b,.rules-list #retention-rule{color:var(--ios-ink)!important;font-weight:650!important}
+.rules-note{padding-top:9px;border-top:1px solid rgba(118,118,128,.14);color:var(--ios-tertiary);font-size:10px;line-height:1.55}
+.header-actions{display:flex;align-items:center;gap:10px}.notification-toggle{width:34px!important;min-width:34px!important;height:34px!important;padding:0!important;display:grid!important;place-items:center;color:var(--ios-secondary)!important;border:0!important;border-radius:50%!important;background:transparent!important;box-shadow:none!important}.notification-toggle:hover{color:var(--ios-blue)!important;transform:none!important;background:rgba(255,255,255,.34)!important}.notification-toggle.enabled{color:var(--ios-blue)!important}.notification-toggle .lucide{width:17px;height:17px}
+.message-name.mention-target{cursor:pointer}.message-name.mention-target:hover{text-decoration:underline}.message-reply{display:flex;flex-direction:column;gap:1px;margin:-2px 0 8px;padding:6px 9px;border-left:3px solid var(--ios-blue);border-radius:8px;background:rgba(255,255,255,.3);white-space:normal}.message-reply[hidden]{display:none}.message-reply b{overflow:hidden;color:var(--ios-blue);font-size:10px;line-height:1.4;text-overflow:ellipsis;white-space:nowrap}.message-reply span{display:block;max-width:42ch;overflow:hidden;color:var(--ios-secondary);font-size:11px;line-height:1.4;text-overflow:ellipsis;white-space:nowrap}.message.self .message-reply{border-left-color:rgba(10,132,255,.72);background:rgba(255,255,255,.38)}.message.mentioned .message-bubble{box-shadow:inset 0 0 0 2px rgba(255,149,0,.5),0 10px 28px rgba(255,149,0,.16)!important}
+.reply-preview{position:absolute;left:0;right:0;bottom:calc(100% + 8px);min-width:0;padding:8px 10px 8px 13px;display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.86);border-left:3px solid var(--ios-blue);border-radius:15px;background:rgba(244,250,255,.94);box-shadow:0 9px 24px rgba(43,66,92,.14);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.reply-preview[hidden]{display:none}.reply-preview>div{min-width:0;display:flex;flex-direction:column}.reply-preview b{color:var(--ios-blue);font-size:11px}.reply-preview span{overflow:hidden;color:var(--ios-secondary);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.reply-preview button{width:30px!important;min-width:30px!important;height:30px!important;padding:0!important;border:0!important;border-radius:50%!important;background:transparent!important;box-shadow:none!important}.reply-preview button:hover{color:var(--ios-blue)!important;transform:none!important;background:rgba(10,132,255,.08)!important}.reply-preview .lucide{width:15px;height:15px}
+.chat.file-dragging::after{content:'松开发送文件';position:absolute;z-index:18;inset:12px;display:grid;place-items:center;border:2px dashed rgba(10,132,255,.65);border-radius:24px;color:var(--ios-blue);background:rgba(239,248,255,.9);font-size:18px;font-weight:750;letter-spacing:.08em;pointer-events:none;backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px)}
+.message-file.has-image{grid-template-areas:'preview preview' 'name download' 'meta download';width:min(360px,100%)}.file-image-button{grid-area:preview;width:100%!important;min-width:0!important;height:auto!important;max-height:none!important;margin:0 0 9px;padding:0!important;display:block;overflow:hidden;border:0!important;border-radius:14px!important;background:rgba(255,255,255,.3)!important;box-shadow:none!important;line-height:0}.file-image-button[hidden]{display:none}.file-image-button:hover{transform:none!important;box-shadow:0 6px 18px rgba(35,70,105,.16)!important}.file-image{display:block;width:100%;max-height:240px;object-fit:contain;background:rgba(22,35,48,.08);cursor:zoom-in}.image-preview-modal{z-index:40;background:rgba(10,16,23,.88)!important;backdrop-filter:blur(10px)!important;-webkit-backdrop-filter:blur(10px)!important}.image-preview-frame{position:relative;width:min(94vw,1280px);height:min(90vh,900px);display:grid;grid-template-rows:minmax(0,1fr) auto;place-items:center;gap:10px}.image-preview-image{display:block;max-width:100%;max-height:calc(90vh - 52px);object-fit:contain;border-radius:12px;box-shadow:0 22px 70px rgba(0,0,0,.46)}.image-preview-caption{max-width:min(90vw,760px);overflow:hidden;color:#fff;font-size:13px;text-overflow:ellipsis;white-space:nowrap}.image-preview-close{position:absolute!important;z-index:2;top:0;right:0;width:42px!important;min-width:42px!important;height:42px!important;padding:0!important;display:grid!important;place-items:center;color:#fff!important;border:1px solid rgba(255,255,255,.35)!important;border-radius:50%!important;background:rgba(12,18,25,.55)!important;box-shadow:none!important}.image-preview-close:hover{transform:none!important;background:rgba(255,255,255,.2)!important}.image-preview-close .lucide{width:20px;height:20px}
+.channel-meta{display:flex;align-items:center;gap:7px}.channel-unread{min-width:18px;height:18px;padding:0 5px;display:grid;place-items:center;border-radius:9px;color:#fff;background:#ff3b30;font-size:10px;font-weight:750;line-height:1;box-shadow:0 0 0 2px rgba(255,59,48,.1)}
+.message-reactions{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px;white-space:normal}.message-reactions[hidden]{display:none}.reaction-button{width:auto!important;min-width:34px!important;height:25px!important;padding:0 8px!important;border:1px solid rgba(90,112,132,.16)!important;border-radius:999px!important;color:var(--ios-secondary)!important;background:rgba(255,255,255,.28)!important;box-shadow:none!important;font-size:12px!important;line-height:1!important;letter-spacing:0!important}.reaction-button:hover{color:var(--ios-blue)!important;border-color:rgba(10,132,255,.28)!important;background:rgba(255,255,255,.52)!important;transform:none!important;box-shadow:none!important}.reaction-button.active{color:var(--ios-blue)!important;border-color:rgba(10,132,255,.34)!important;background:rgba(10,132,255,.12)!important}.message.self .reaction-button{background:rgba(255,255,255,.42)!important}.message.jump-highlight .message-bubble{box-shadow:0 0 0 4px rgba(230,162,60,.48),0 12px 34px rgba(230,162,60,.2)!important}
+.message-reply{width:100%!important;min-width:0!important;height:auto!important;text-align:left!important;color:inherit!important;border:0!important;border-left:3px solid var(--ios-blue)!important;box-shadow:none!important;letter-spacing:0!important;cursor:pointer}.message-reply:hover{transform:none!important;box-shadow:none!important;background:rgba(255,255,255,.5)!important}
+@media (max-width:700px){.header-actions{gap:5px}.notification-toggle{width:30px!important;min-width:30px!important;height:30px!important}.reply-preview{left:-2px;right:-2px}.message-reply span{max-width:26ch}}
 </style>
 </head>
 <body>
@@ -1378,10 +1423,10 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     <defs>
       <symbol id="lucide-radio" viewBox="0 0 24 24"><path d="M4.9 19.1a10 10 0 0 1 0-14.2M7.8 16.2a6 6 0 0 1 0-8.5M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/><path d="M16.2 7.8a6 6 0 0 1 0 8.5M19.1 4.9a10 10 0 0 1 0 14.2"/></symbol>
       <symbol id="lucide-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
-      <symbol id="lucide-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></symbol>
       <symbol id="lucide-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
       <symbol id="lucide-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
       <symbol id="lucide-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+      <symbol id="lucide-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></symbol>
       <symbol id="lucide-paperclip" viewBox="0 0 24 24"><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7l-9.6 9.6a2 2 0 0 1-2.8-2.8l8.9-8.9"/></symbol>
       <symbol id="lucide-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
       <symbol id="lucide-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
@@ -1397,10 +1442,13 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       <symbol id="lucide-hash" viewBox="0 0 24 24"><path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/></symbol>
       <symbol id="lucide-pause" viewBox="0 0 24 24"><rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/></symbol>
       <symbol id="lucide-play" viewBox="0 0 24 24"><path d="m6 3 14 9-14 9Z"/></symbol>
+      <symbol id="lucide-reply" viewBox="0 0 24 24"><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></symbol>
+      <symbol id="lucide-bell" viewBox="0 0 24 24"><path d="M10.3 21a2 2 0 0 0 3.4 0M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/></symbol>
+      <symbol id="lucide-bell-off" viewBox="0 0 24 24"><path d="m2 2 20 20M6.3 6.3A6 6 0 0 0 6 8c0 7-3 7-3 9h14M10.3 21a2 2 0 0 0 3.4 0M18 13.7V8a6 6 0 0 0-8.7-5.4M18 18H9"/></symbol>
     </defs>
   </svg>
   <div class="shell">
-    <header><div class="brand"><div class="brand-lockup"><span class="brand-icon"><svg class="lucide"><use href="#lucide-radio"></use></svg></span><span>LAN / CHAT</span><span class="brand-index">LIQUID LOCAL MESSENGER</span></div></div><div class="status"><i class="pulse"></i><span id="connection">正在连接</span></div></header>
+    <header><div class="brand"><div class="brand-lockup"><span class="brand-icon"><svg class="lucide"><use href="#lucide-radio"></use></svg></span><span>LAN / CHAT</span><span class="brand-index">LIQUID LOCAL MESSENGER</span></div></div><div class="header-actions"><button class="notification-toggle" id="notification-toggle" type="button" title="开启桌面通知" aria-label="开启桌面通知"><svg class="lucide"><use href="#lucide-bell-off"></use></svg></button><div class="status"><i class="pulse"></i><span id="connection">正在连接</span></div></div></header>
     <main>
       <aside class="profile-panel">
         <div><div class="kicker" id="kicker">LOCAL / 001</div><h1>轻声落下，<br>即刻消散。</h1><div class="intro">同一网络中的短暂信号。没有账号，没有档案，只留下此刻的回声。</div></div>
@@ -1408,8 +1456,8 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         <div class="identity"><div class="avatar" id="my-avatar"></div><div><small>YOUR SIGNAL</small><input id="my-name" maxlength="5" value="匿名访客" aria-label="编辑用户名"></div></div>
         <div class="user-directory"><div class="search-shell"><svg class="lucide"><use href="#lucide-search"></use></svg><input class="user-search" id="user-search" type="search" placeholder="检索在线用户" aria-label="搜索在线用户"></div><div class="user-list" id="user-list"></div></div>
       </aside>
-      <section class="chat"><div class="chat-top"><div class="chat-title" id="channel-title">频道1（0）</div><div class="typing-indicator" id="typing-indicator" hidden></div><select class="mobile-channel-select" id="mobile-channel-select" aria-label="切换频道"></select><button class="mobile-users-toggle" id="mobile-users-toggle" type="button" aria-label="查看在线用户" aria-expanded="false"><svg class="lucide"><use href="#lucide-users"></use></svg><span>用户</span><span class="mobile-unread-count" id="mobile-unread-count" hidden></span></button></div><div class="messages" id="messages"><div class="messages-spacer" id="messages-spacer"><div class="messages-window" id="messages-window"></div></div></div><div class="transfer-task" id="transfer-task" hidden><div class="transfer-task-head"><div><div class="transfer-task-name" id="transfer-task-name"></div><div class="transfer-task-status" id="transfer-task-status"></div></div><div class="transfer-task-actions"><button class="transfer-task-button" id="transfer-pause" type="button" title="暂停上传" aria-label="暂停上传"><svg class="lucide"><use href="#lucide-pause"></use></svg></button><button class="transfer-task-button" id="transfer-cancel" type="button" title="取消上传" aria-label="取消上传"><svg class="lucide"><use href="#lucide-x"></use></svg></button></div></div><div class="transfer-task-track"><div class="transfer-task-progress" id="transfer-task-progress"></div></div></div><form class="composer" id="composer"><div class="emoji-wrap"><button class="emoji-toggle" id="emoji-toggle" type="button" aria-label="打开表情面板" aria-expanded="false"><svg class="lucide"><use href="#lucide-smile"></use></svg></button><div class="emoji-panel" id="emoji-panel" hidden></div></div><button class="file-toggle" id="file-toggle" type="button" title="发送文件（最大 1 MB，5 分钟后销毁）" aria-label="选择文件"><svg class="lucide"><use href="#lucide-paperclip"></use></svg></button><input class="file-input" id="file-input" type="file" tabindex="-1"><input id="message" maxlength="500" autocomplete="off" placeholder="说点什么……"><button id="send" type="submit"><span class="send-label">发送</span><svg class="lucide"><use href="#lucide-send"></use></svg></button></form></section>
-      <aside class="room-panel"><h2><svg class="lucide"><use href="#lucide-hash"></use></svg><span>CHANNELS</span></h2><div class="channel-list" id="channel-list"></div><div class="metric"><span class="metric-label">全站在线 / CAPACITY</span><div class="metric-value online-value"><span id="total-online">0</span> / 100</div></div><div class="rules"><b id="retention-rule">消息与文件默认保留 5 分钟</b><br>发送后 3 分钟内可以撤回<br>公共频道与私聊均可发送文件<br><span id="file-limit-rule">单文件默认1MB 最大20G</span><br>每 5 秒最多发送 2 条内容</div><div class="room-admin-entry"><div class="admin-status" id="admin-status" hidden></div><div class="sync" id="refresh">等待同步</div></div></aside>
+      <section class="chat"><div class="chat-top"><div class="chat-title" id="channel-title">频道1（0）</div><div class="typing-indicator" id="typing-indicator" hidden></div><select class="mobile-channel-select" id="mobile-channel-select" aria-label="切换频道"></select><button class="mobile-users-toggle" id="mobile-users-toggle" type="button" aria-label="查看在线用户" aria-expanded="false"><svg class="lucide"><use href="#lucide-users"></use></svg><span>用户</span><span class="mobile-unread-count" id="mobile-unread-count" hidden></span></button></div><div class="messages" id="messages"><div class="messages-spacer" id="messages-spacer"><div class="messages-window" id="messages-window"></div></div></div><div class="transfer-task" id="transfer-task" hidden><div class="transfer-task-head"><div><div class="transfer-task-name" id="transfer-task-name"></div><div class="transfer-task-status" id="transfer-task-status"></div></div><div class="transfer-task-actions"><button class="transfer-task-button" id="transfer-pause" type="button" title="暂停上传" aria-label="暂停上传"><svg class="lucide"><use href="#lucide-pause"></use></svg></button><button class="transfer-task-button" id="transfer-cancel" type="button" title="取消上传" aria-label="取消上传"><svg class="lucide"><use href="#lucide-x"></use></svg></button></div></div><div class="transfer-task-track"><div class="transfer-task-progress" id="transfer-task-progress"></div></div></div><form class="composer" id="composer"><div class="reply-preview" id="reply-preview" hidden><div><b id="reply-preview-name"></b><span id="reply-preview-text"></span></div><button id="reply-cancel" type="button" title="取消回复" aria-label="取消回复"><svg class="lucide"><use href="#lucide-x"></use></svg></button></div><div class="emoji-wrap"><button class="emoji-toggle" id="emoji-toggle" type="button" aria-label="打开表情面板" aria-expanded="false"><svg class="lucide"><use href="#lucide-smile"></use></svg></button><div class="emoji-panel" id="emoji-panel" hidden></div></div><button class="file-toggle" id="file-toggle" type="button" title="发送文件（最大 1 MB，10 分钟后销毁）" aria-label="选择文件"><svg class="lucide"><use href="#lucide-paperclip"></use></svg></button><input class="file-input" id="file-input" type="file" tabindex="-1"><input id="message" maxlength="500" autocomplete="off" placeholder="说点什么……"><button id="send" type="submit"><span class="send-label">发送</span><svg class="lucide"><use href="#lucide-send"></use></svg></button></form></section>
+      <aside class="room-panel"><h2><svg class="lucide"><use href="#lucide-hash"></use></svg><span>CHANNELS</span></h2><div class="channel-list" id="channel-list"></div><div class="metric"><span class="metric-label">全站在线 / CAPACITY</span><div class="metric-value online-value"><span id="total-online">0</span> / 100</div></div><section class="rules" aria-label="温馨提示"><div class="rules-title"><svg class="lucide"><use href="#lucide-info"></use></svg><span>温馨提示</span></div><ul class="rules-list"><li><span id="retention-rule">消息与中转文件将在 10 分钟后自动销毁</span></li><li>消息发送后 <b>3 分钟内</b>可以撤回</li><li>点击昵称可快速 <b>@用户</b>，消息下方支持回复与表情回应</li><li>可拖放、粘贴或点击回形针发送文件，<b id="file-limit-rule">单文件上限 1 MB</b></li><li>支持的图片会直接显示，点击即可放大预览</li><li>每 5 秒最多发送 <b>2 条</b>文字或文件消息</li></ul><div class="rules-note">这里没有服务端账号，重要内容请在自动销毁前及时保存。</div></section><div class="room-admin-entry"><div class="admin-status" id="admin-status" hidden></div><div class="sync" id="refresh">等待同步</div></div></aside>
     </main>
   </div>
   <div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
@@ -1424,7 +1472,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
           <section class="admin-tool-panel">
             <h3>内容限制</h3>
             <div class="admin-settings">
-              <label class="admin-setting-row"><span>消息与文件销毁时间（分钟）</span><input id="admin-retention" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="5" autocomplete="off" aria-label="销毁时间，单位分钟，仅允许输入数字"></label>
+              <label class="admin-setting-row"><span>消息与文件销毁时间（分钟）</span><input id="admin-retention" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" value="10" autocomplete="off" aria-label="销毁时间，单位分钟，仅允许输入数字"></label>
               <label class="admin-setting-row"><span>单个文件大小上限（MB，最高 20 GB）</span><input id="admin-file-limit" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="5" value="1" autocomplete="off" aria-label="文件大小上限，单位 MB，最高 20 GB，仅允许输入数字"></label>
               <button class="admin-settings-save" type="button" id="admin-settings-save">应用设置</button>
               <p class="admin-settings-note">可输入 1–1440 分钟和 1–20480 MB（20 GB）。设置实时同步给所有在线用户，并在服务重启后继续生效。</p>
@@ -1437,11 +1485,14 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     </div>
   </div>
   <div class="modal-backdrop" id="user-modal" hidden><div class="modal"><h2>用户信息</h2><div class="user-detail" id="user-detail">正在读取</div><div class="modal-actions user-modal-actions"><button type="button" id="user-ban-button" hidden>封禁此 IP</button><button type="button" data-close="user-modal">关闭</button></div></div></div>
+  <div class="modal-backdrop image-preview-modal" id="image-preview-modal" hidden><div class="image-preview-frame"><button class="image-preview-close" id="image-preview-close" type="button" title="关闭图片预览" aria-label="关闭图片预览"><svg class="lucide"><use href="#lucide-x"></use></svg></button><img class="image-preview-image" id="image-preview-image" alt="图片预览"><div class="image-preview-caption" id="image-preview-caption"></div></div></div>
   <div class="blocker" id="blocker" hidden><div class="blocker-card"><h2 id="blocker-title">ROOM IS FULL</h2><p id="blocker-message">当前聊天室同时在线已满，新的连接暂时无法进入。请稍后刷新再试，或等待现有连接超时释放。</p><div class="blocker-meta"><span id="blocker-meta-limit">LIMIT 100</span><span id="blocker-retry">RETRY IN 5s</span></div></div></div>
   <script>
     const names = ['雾中信号','午夜电台','路过的人','蓝色回声','未读消息','七号窗口','风的背面','纸上月光','无名之声','半格电量','雨后电台','凌晨三点','玻璃海岸','远方来客','静默频道','白噪音','南墙以北','小行星带','旧磁带','临时月亮','低空飞行','纸船渡口','橘色回声','没有署名','第九街角','慢速星球','失眠旅人','空白信笺','北纬三十','候车室里','微光入口','借过一下','晴天留声机','倒带之前','未完句号','晚风收件箱','路灯下面','隐身模式','落日存档','匿名观测员','月面漫步者','雨伞借我','发呆俱乐部','半夜醒来','蓝调星期五','海边的字','轻声路过','没有目的地','风筝线外','借来的名字'];
     const LOCAL_NAME_KEY = 'lan-chat.user-name.v1';
     const SESSION_ID_KEY = 'lan-chat.session-id.v1';
+    const NOTIFICATION_KEY = 'lan-chat.desktop-notifications.v1';
+    const BASE_TITLE = 'LAN CHAT';
     function normalizedName(value) { return Array.from(String(value||'').trim()).slice(0,5).join(''); }
     function readLocalName() {
       try { return normalizedName(localStorage.getItem(LOCAL_NAME_KEY)); }
@@ -1463,7 +1514,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     }
     const identity = { name:localName||names[Math.floor(Math.random()*names.length)], id:sessionIdentityId() };
     saveLocalName(identity.name);
-    const state = { messages:[], users:[], typing:[], privateUnread:{}, privateActivity:{}, online:0, cursor:0, polling:false, uploading:false, uploadTask:null, nameEdited:false, mode:'channel', peer:null, channel:'channel1', channels:[], onlineByChannel:{}, adminToken:'', full:false, blockedReason:'', sendCooldownUntil:0, retentionMs:300000, recallWindowMs:180000, maxFileBytes:1048576, renderBatch:100, pollInterval:1500, blockRetry:5000, canAdmin:false, scrollLocked:true };
+    const state = { messages:[], users:[], typing:[], privateUnread:{}, previousPrivateUnread:{}, channelUnread:{}, previousChannelUnread:{}, privateActivity:{}, online:0, cursor:0, polling:false, uploading:false, uploadTask:null, nameEdited:false, mode:'channel', peer:null, channel:'channel1', channels:[], onlineByChannel:{}, adminToken:'', full:false, blockedReason:'', sendCooldownUntil:0, retentionMs:600000, recallWindowMs:180000, maxFileBytes:1048576, maxImagePreviewBytes:25*1024*1024, renderBatch:100, pollInterval:1500, blockRetry:5000, canAdmin:false, scrollLocked:true, replyingTo:null, notificationsEnabled:false, pageUnread:0, suppressIncomingOnce:true, previewingMessageId:'' };
     const RTC_DIRECT_MAX_BYTES=64*1024*1024;
     const rtcPeers=new Map(); const rtcAckWaiters=new Map(); const directFiles=new Map();
     const $ = id => document.getElementById(id);
@@ -1472,7 +1523,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     const limitedCpu=Number(navigator.hardwareConcurrency||8)<=4;
     const limitedMemory=Number(navigator.deviceMemory||8)<=4;
     document.documentElement.classList.toggle('performance-lite',prefersLessMotion||limitedCpu||limitedMemory);
-    const availableIcons = new Set(['radio','users','smile','chevron-left','chevron-right','x','paperclip','send','copy','rotate-ccw','download','settings-2','shield-check','check','info','triangle-alert','circle-x','search','hash','pause','play']);
+    const availableIcons = new Set(['radio','users','smile','chevron-left','chevron-right','x','paperclip','send','copy','rotate-ccw','download','settings-2','shield-check','check','info','triangle-alert','circle-x','search','hash','pause','play','reply','bell','bell-off']);
     function iconNode(name, className='lucide') {
       const safe=availableIcons.has(name)?name:'radio';
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
@@ -1578,9 +1629,93 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       toast.append(icon,text); host.append(toast); requestAnimationFrame(()=>toast.classList.add('visible'));
       toastTimer=setTimeout(()=>{ toast.classList.remove('visible'); setTimeout(()=>{ if(toast.parentNode===host) toast.remove(); },180); },2000);
     }
+    function updateTitleReminder() {
+      document.title=state.pageUnread?BASE_TITLE+' · 未读消息 '+state.pageUnread:BASE_TITLE;
+    }
+    function clearPageUnread() { state.pageUnread=0; updateTitleReminder(); }
+    function addPageUnread(count=1) {
+      if(!document.hidden&&document.hasFocus()) return;
+      state.pageUnread=Math.min(999,state.pageUnread+Math.max(1,count));
+      updateTitleReminder();
+    }
+    function notificationSupported() { return 'Notification' in window; }
+    function saveNotificationPreference(enabled) { try { localStorage.setItem(NOTIFICATION_KEY,enabled?'1':'0'); } catch {} }
+    function syncNotificationToggle() {
+      const button=$('notification-toggle');
+      const enabled=notificationSupported()&&Notification.permission==='granted'&&state.notificationsEnabled;
+      state.notificationsEnabled=enabled;
+      button.classList.toggle('enabled',enabled); setIcon(button,enabled?'bell':'bell-off');
+      button.title=enabled?'桌面通知已开启，点击关闭':'开启桌面通知'; button.setAttribute('aria-label',button.title);
+    }
+    async function toggleDesktopNotifications() {
+      if(!notificationSupported()) { showToast('当前浏览器不支持桌面通知','warning'); return; }
+      if(state.notificationsEnabled) { state.notificationsEnabled=false; saveNotificationPreference(false); syncNotificationToggle(); showToast('桌面通知已关闭','info'); return; }
+      let permission=Notification.permission;
+      try { if(permission!=='granted') permission=await Notification.requestPermission(); }
+      catch { permission='denied'; }
+      state.notificationsEnabled=permission==='granted'; saveNotificationPreference(state.notificationsEnabled); syncNotificationToggle();
+      showToast(state.notificationsEnabled?'桌面通知已开启':'未获得通知权限',state.notificationsEnabled?'success':'warning');
+    }
+    function messagePreview(message) {
+      if(message.file) return '[文件] '+message.file.name;
+      return String(message.text||'').replace(/\s+/g,' ').slice(0,90)||'发来一条新消息';
+    }
+    function messageMentionsMe(message) { return message.senderId!==identity.id&&!!identity.name&&String(message.text||'').includes('@'+identity.name); }
+    function notifyDesktop(title,body,tag) {
+      if(!state.notificationsEnabled||!notificationSupported()||Notification.permission!=='granted'||(!document.hidden&&document.hasFocus())) return;
+      try { const notice=new Notification(title,{body,tag}); notice.onclick=()=>{ window.focus(); notice.close(); }; } catch {}
+    }
+    function handleIncomingMessages(items,suppress) {
+      if(suppress||!items.length) return;
+      const incoming=items.filter(message=>message.senderId!==identity.id&&!message.recalled);
+      if(!incoming.length) return;
+      addPageUnread(incoming.length);
+      incoming.forEach(message=>{
+        const mentioned=messageMentionsMe(message);
+        const context=message.mode==='private'?'私聊消息':mentioned?'有人提到了你':'频道新消息';
+        notifyDesktop(context+' · '+message.name,messagePreview(message),'lan-chat-message-'+message.id);
+        if(mentioned&&!document.hidden&&document.hasFocus()) showToast(message.name+' 在消息中提到了你','info');
+      });
+    }
+    function handlePrivateUnreadIncreases(previous,next,suppress) {
+      if(suppress) return;
+      Object.entries(next).forEach(([peerId,count])=>{
+        const delta=Number(count||0)-Number(previous[peerId]||0);
+        if(delta<=0) return;
+        const user=state.users.find(item=>item.id===peerId); const name=user?.name||'一位用户';
+        addPageUnread(delta); notifyDesktop(name+' 发来私聊消息',delta+' 条未读私聊消息','lan-chat-private-'+peerId);
+      });
+    }
+    function handleChannelUnreadIncreases(previous,next,suppress) {
+      if(suppress) return;
+      Object.entries(next).forEach(([channelId,count])=>{
+        const delta=Number(count||0)-Number(previous[channelId]||0);
+        if(delta<=0) return;
+        const channel=state.channels.find(item=>item.id===channelId); const name=channel?.name||'公共频道';
+        addPageUnread(delta); notifyDesktop(name+' 有新消息',delta+' 条未读频道消息','lan-chat-channel-'+channelId);
+      });
+    }
+    try { state.notificationsEnabled=notificationSupported()&&Notification.permission==='granted'&&localStorage.getItem(NOTIFICATION_KEY)==='1'; } catch {}
+    syncNotificationToggle();
+    $('notification-toggle').addEventListener('click',toggleDesktopNotifications);
+    document.addEventListener('visibilitychange',()=>{ if(!document.hidden) clearPageUnread(); });
+    window.addEventListener('focus',clearPageUnread);
+    const identityCard=document.querySelector('.identity');
+    function placeIdentityForViewport(usersOpen=document.body.classList.contains('mobile-users-open')) {
+      const chatTop=document.querySelector('.chat-top');
+      const profilePanel=document.querySelector('.profile-panel');
+      const channelSelect=$('mobile-channel-select');
+      const userDirectory=profilePanel?.querySelector('.user-directory');
+      if(!identityCard||!chatTop||!profilePanel||!channelSelect||!userDirectory) return false;
+      const target=window.innerWidth<=700&&!usersOpen?chatTop:profilePanel;
+      const before=target===chatTop?channelSelect:userDirectory;
+      if(identityCard.parentElement!==target||identityCard.nextElementSibling!==before) target.insertBefore(identityCard,before);
+      return true;
+    }
     function setMobileUsersOpen(open) {
       document.body.classList.toggle('mobile-users-open',!!open);
       $('mobile-users-toggle').setAttribute('aria-expanded',open?'true':'false');
+      placeIdentityForViewport(!!open);
     }
     const emojis = [
       '😀','😃','😄','😁','😆','😅','🤣','😂','🙂','🙃','😉','😊',
@@ -1612,7 +1747,9 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     previousEmojiPage.addEventListener('click',()=>{ if(emojiPage>0){ emojiPage--; renderEmojiPage(); } });
     nextEmojiPage.addEventListener('click',()=>{ if(emojiPage<Math.ceil(emojis.length/emojiPageSize)-1){ emojiPage++; renderEmojiPage(); } });
     renderEmojiPage();
-    $('my-name').value = identity.name; setAvatarInitial($('my-avatar'),identity.name);
+    $('my-name').value=identity.name;
+    setAvatarInitial($('my-avatar'),identity.name);
+    if(!placeIdentityForViewport(false)&&document.readyState==='loading') document.addEventListener('DOMContentLoaded',()=>placeIdentityForViewport(false),{once:true});
     const apiBase = location.protocol === 'file:' ? 'http://localhost:9000' : '';
     const DEFAULT_ROW = 80;
     const ROW_GAP = 16;
@@ -1674,6 +1811,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         const response=await fetch(apiBase+'/api/message/recall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:identity.id,messageId})});
         const data=await response.json().catch(()=>({}));
         if(!response.ok) throw Error(data.error||'recall failed');
+        if(state.previewingMessageId===messageId) closeImagePreview();
         const index=state.messages.findIndex(message=>message.id===messageId);
         if(index!==-1) { releaseDirectFile(state.messages[index]); state.messages[index]=data.message; }
         const oldNode=vlist.nodeMap.get(messageId); if(oldNode) oldNode.remove(); vlist.nodeMap.delete(messageId);
@@ -1698,18 +1836,68 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       const transferId=message?.file?.direct&&(message.file.transferId||message.file.id); const directFile=transferId&&directFiles.get(transferId);
       if(directFile) { URL.revokeObjectURL(directFile.url); directFiles.delete(transferId); }
     }
+    function replyText(message) { return message.file?'[文件] '+message.file.name:String(message.text||'').replace(/\s+/g,' ').slice(0,120); }
+    function renderReplyPreview() {
+      const reply=state.replyingTo; const root=$('reply-preview'); root.hidden=!reply;
+      if(!reply) return;
+      $('reply-preview-name').textContent='回复 '+reply.name;
+      $('reply-preview-text').textContent=reply.preview;
+    }
+    function clearReply() { state.replyingTo=null; renderReplyPreview(); }
+    function setReplyTarget(message) {
+      if(!message||message.recalled) return;
+      state.replyingTo={id:message.id,name:message.name||'匿名用户',preview:replyText(message),at:message.at};
+      renderReplyPreview(); $('message').focus();
+    }
+    function insertMention(name) {
+      const input=$('message'); const mention='@'+String(name||'').trim()+' ';
+      if(mention==='@ ') return;
+      const start=input.selectionStart??input.value.length; const end=input.selectionEnd??start;
+      const prefix=input.value.slice(0,start); const spacer=prefix&&!/\s$/.test(prefix)?' ':'';
+      const next=(prefix+spacer+mention+input.value.slice(end)).slice(0,Number(input.maxLength)||500);
+      input.value=next; input.focus(); input.selectionStart=input.selectionEnd=Math.min(next.length,start+spacer.length+mention.length);
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+    }
+    function jumpToMessage(messageId) {
+      const index=state.messages.findIndex(message=>message.id===messageId);
+      if(index===-1) { showToast('原消息已过期或未加载','warning'); return; }
+      syncPrefix(); const root=$('messages'); state.scrollLocked=false;
+      root.scrollTop=Math.max(0,vlist.prefixSum[index]-Math.max(20,root.clientHeight/3)); render({force:true});
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        const row=vlist.nodeMap.get(messageId);
+        if(!row) { showToast('暂时无法定位原消息','warning'); return; }
+        row.scrollIntoView({block:'center',behavior:prefersLessMotion?'auto':'smooth'}); row.classList.add('jump-highlight');
+        setTimeout(()=>row.classList.remove('jump-highlight'),1400);
+      }));
+    }
+    function clientPreviewImageType(file) {
+      const declared=String(file?.type||'').toLowerCase().split(';')[0].trim();
+      if(['image/jpeg','image/png','image/gif','image/webp','image/avif','image/bmp'].includes(declared)) return declared;
+      const match=String(file?.name||'').toLowerCase().match(/\.(jpe?g|png|gif|webp|avif|bmp)$/);
+      return match?match[1]:'';
+    }
+    function closeImagePreview() {
+      state.previewingMessageId=''; $('image-preview-modal').hidden=true; $('image-preview-image').removeAttribute('src'); $('image-preview-caption').textContent='';
+    }
+    function openImagePreview(src,name,messageId) {
+      state.previewingMessageId=messageId; $('image-preview-image').src=src; $('image-preview-image').alt=name;
+      $('image-preview-caption').textContent=name; $('image-preview-modal').hidden=false; $('image-preview-close').focus();
+    }
     function createRow(m, isNew) {
       const self = m.senderId === identity.id;
       const row = document.createElement('div');
-      row.className = 'message' + (self ? ' self' : '') + (isNew ? ' is-new' : '') + (m.recalled ? ' recalled' : '');
+      row.className = 'message' + (self ? ' self' : '') + (isNew ? ' is-new' : '') + (m.recalled ? ' recalled' : '') + (messageMentionsMe(m)?' mentioned':'');
       row.dataset.id = m.id;
       row.dataset.sender = m.senderId || '';
       row.dataset.at = String(m.at);
       row.dataset.expiresAt = String(m.at + state.retentionMs);
-      row.innerHTML = '<div class="message-avatar"></div><div class="message-meta"><div class="message-name"></div><span class="message-status"></span></div><div class="message-bubble"><span class="message-text"></span><div class="message-file" hidden><div class="file-name"></div><div class="file-meta"></div><a class="file-download"></a></div><div class="message-footer"><button class="message-action copy-action" type="button" title="复制消息" aria-label="复制消息"></button><time class="message-time"></time><button class="message-action recall-action" type="button" title="撤回消息" aria-label="撤回消息"></button></div></div>';
+      row.innerHTML = '<div class="message-avatar"></div><div class="message-meta"><div class="message-name"></div><span class="message-status"></span></div><div class="message-bubble"><button class="message-reply" type="button" hidden><b></b><span></span></button><span class="message-text"></span><div class="message-file" hidden><button class="file-image-button" type="button" hidden><img class="file-image" loading="lazy" decoding="async"></button><div class="file-name"></div><div class="file-meta"></div><a class="file-download"></a></div><div class="message-footer"><button class="message-action reply-action" type="button" title="回复消息" aria-label="回复消息"></button><button class="message-action copy-action" type="button" title="复制消息" aria-label="复制消息"></button><time class="message-time"></time><button class="message-action recall-action" type="button" title="撤回消息" aria-label="撤回消息"></button></div></div>';
       setAvatarInitial(row.querySelector('.message-avatar'),m.name);
-      row.querySelector('.message-name').textContent = m.name;
+      const messageName=row.querySelector('.message-name'); messageName.textContent=m.name;
+      if(!self&&!m.recalled) { messageName.classList.add('mention-target'); messageName.title='点击在输入框中 @'+m.name; messageName.addEventListener('click',()=>insertMention(m.name)); }
       const statusText=privateMessageStatus(m); row.querySelector('.message-status').textContent=statusText; row.querySelector('.message-status').hidden=!statusText;
+      const replyCard=row.querySelector('.message-reply');
+      if(m.reply) { replyCard.hidden=false; replyCard.querySelector('b').textContent=m.reply.name; replyCard.querySelector('span').textContent=m.reply.preview; replyCard.title='跳转到被引用的消息'; replyCard.setAttribute('aria-label','跳转到 '+m.reply.name+' 的原消息'); replyCard.addEventListener('click',()=>jumpToMessage(m.reply.id)); }
       const textNode=row.querySelector('.message-text');
       textNode.textContent = m.recalled ? '该消息已撤回' : m.text;
       const fileCard=row.querySelector('.message-file');
@@ -1718,20 +1906,32 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         row.querySelector('.file-name').textContent=m.file.name;
         row.querySelector('.file-meta').textContent=formatFileSize(m.file.size)+' · '+formatDuration(state.retentionMs)+'后销毁';
         const download=row.querySelector('.file-download');
+        let previewUrl='';
         if(m.file.direct) {
           const directFile=directFiles.get(m.file.transferId||m.file.id);
-          if(directFile) { download.href=directFile.url; download.download=m.file.name; download.title='下载 '+m.file.name; download.append(iconNode('download'),document.createTextNode('下载')); }
+          if(directFile) { previewUrl=directFile.url; download.href=directFile.url; download.download=m.file.name; download.title='下载 '+m.file.name; download.append(iconNode('download'),document.createTextNode('下载')); }
           else { download.removeAttribute('href'); download.setAttribute('aria-disabled','true'); download.title='点对点传输已完成'; download.append(iconNode('check'),document.createTextNode(self?'已直传':'已接收')); }
         } else {
-          download.href=apiBase+'/api/file/'+encodeURIComponent(m.file.id)+'?client='+encodeURIComponent(identity.id)+'&token='+encodeURIComponent(m.file.token);
+          const fileUrl=apiBase+'/api/file/'+encodeURIComponent(m.file.id)+'?client='+encodeURIComponent(identity.id)+'&token='+encodeURIComponent(m.file.token);
+          download.href=fileUrl; previewUrl=fileUrl+'&preview=1';
           download.download=m.file.name; download.title='下载 '+m.file.name; download.append(iconNode('download'),document.createTextNode('下载'));
         }
+        if(previewUrl&&clientPreviewImageType(m.file)&&m.file.size<=state.maxImagePreviewBytes) {
+          fileCard.classList.add('has-image'); const previewButton=row.querySelector('.file-image-button'); const image=previewButton.querySelector('img');
+          previewButton.hidden=false; previewButton.title='点击放大预览 '+m.file.name; previewButton.setAttribute('aria-label',previewButton.title); image.alt=m.file.name; image.src=previewUrl;
+          previewButton.addEventListener('click',()=>openImagePreview(previewUrl,m.file.name,m.id));
+          image.addEventListener('load',()=>requestAnimationFrame(()=>{ const height=row.getBoundingClientRect().height; if(height) { vlist.heights.set(m.id,height); syncPrefix(); $('messages-spacer').style.height=(vlist.prefixSum[vlist.prefixSum.length-1]+BLOCK_PADDING)+'px'; } }),{once:true});
+          image.addEventListener('error',()=>{ previewButton.hidden=true; fileCard.classList.remove('has-image'); },{once:true});
+        }
       }
+      const replyButton=row.querySelector('.reply-action');
       const copyButton=row.querySelector('.copy-action');
       const recallButton=row.querySelector('.recall-action');
-      setIcon(copyButton,'copy'); setIcon(recallButton,'rotate-ccw');
+      setIcon(replyButton,'reply'); setIcon(copyButton,'copy'); setIcon(recallButton,'rotate-ccw');
+      replyButton.hidden=!!m.recalled;
       copyButton.hidden=!!m.recalled||!m.text;
       recallButton.hidden=!self||!!m.recalled||Date.now()-m.at>state.recallWindowMs;
+      replyButton.addEventListener('click',()=>setReplyTarget(m));
       if(m.text) copyButton.addEventListener('click',()=>copyMessageText(m.text,copyButton));
       recallButton.addEventListener('click',()=>recallMessage(m.id,recallButton));
       updateMessageCountdown(row, m.at);
@@ -1749,15 +1949,15 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     }
     function formatDuration(ms) { return Math.round(ms/60000)+' 分钟'; }
     function syncLimitUI() {
-      setText($('retention-rule'),'消息与文件默认保留 '+formatDuration(state.retentionMs));
-      setText($('file-limit-rule'),'单文件默认1MB 最大20G');
+      setText($('retention-rule'),'消息与文件默认保留 10 分钟，管理员可实时调整；当前为 '+formatDuration(state.retentionMs));
+      setText($('file-limit-rule'),'单文件上限最高 20 GB，当前为 '+formatFileSize(state.maxFileBytes));
     }
     function formatRemaining(ms) {
       const seconds = Math.max(0, Math.ceil(ms / 1000));
       return String(Math.floor(seconds / 60)).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0');
     }
     function updateMessageCountdown(row, at) {
-      row.querySelector('.message-time').textContent = '剩余 ' + formatRemaining(at + state.retentionMs - Date.now());
+      row.querySelector('.message-time').textContent = formatRemaining(at + state.retentionMs - Date.now());
     }
     function measureInserted(ids) {
       ids.forEach(id => {
@@ -1835,7 +2035,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         state.channel,
         state.peer?.id||'',
         state.peer?.name||'',
-        state.channels.map(channel=>[channel.id,channel.name,state.onlineByChannel[channel.id]||0])
+        state.channels.map(channel=>[channel.id,channel.name,state.onlineByChannel[channel.id]||0,state.channelUnread[channel.id]||0])
       ]);
       if(renderCache.channels!==listSignature) {
         const fragment=document.createDocumentFragment();
@@ -1847,14 +2047,16 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
           const button=document.createElement('button');
           button.type='button';
           button.className='channel-button'+(state.mode==='channel'&&channel.id===state.channel?' active':'');
-          button.innerHTML='<span></span><span class="channel-count"></span>';
-          button.querySelector('span').textContent=channel.name;
+          button.innerHTML='<span class="channel-name"></span><span class="channel-meta"><span class="channel-count"></span></span>';
+          button.querySelector('.channel-name').textContent=channel.name;
           button.querySelector('.channel-count').textContent=state.onlineByChannel[channel.id]||0;
+          const unread=state.channelUnread[channel.id]||0;
+          if(unread) { const badge=document.createElement('span'); badge.className='channel-unread'; badge.textContent=unread>99?'99+':String(unread); button.querySelector('.channel-meta').append(badge); }
           button.addEventListener('click',()=>switchChannel(channel.id));
           fragment.append(button);
           const option=document.createElement('option');
           option.value=channel.id;
-          option.textContent=channel.name+'（'+(state.onlineByChannel[channel.id]||0)+'）';
+          option.textContent=channel.name+'（'+(state.onlineByChannel[channel.id]||0)+'）'+(unread?' · 未读 '+unread:'');
           selectFragment.append(option);
         });
         root.replaceChildren(fragment);
@@ -1951,9 +2153,13 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       state.mode='channel';
       state.peer=null;
       state.channel=channel;
+      state.channelUnread[channel]=0;
       state.cursor=0;
       state.messages=[];
+      state.suppressIncomingOnce=true;
       state.scrollLocked=true;
+      closeImagePreview();
+      clearReply();
       resetVlist();
       render();
       renderChannels();
@@ -1969,7 +2175,10 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       state.privateUnread[user.id]=0;
       state.cursor=0;
       state.messages=[];
+      state.suppressIncomingOnce=true;
       state.scrollLocked=true;
+      closeImagePreview();
+      clearReply();
       resetVlist();
       render();
       renderChannels();
@@ -2106,8 +2315,10 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     }
     function tick() {
       const now=Date.now();
+      if(state.replyingTo&&now-state.replyingTo.at>=state.retentionMs) clearReply();
       const active=state.messages.filter(m=>now-m.at<state.retentionMs);
       if(active.length!==state.messages.length) {
+        if(state.previewingMessageId&&!active.some(message=>message.id===state.previewingMessageId)) closeImagePreview();
         state.messages.filter(m=>now-m.at>=state.retentionMs).forEach(releaseDirectFile);
         state.messages=active;
         render({force:true});
@@ -2209,6 +2420,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         if(typeof data.pollInterval === 'number') state.pollInterval = data.pollInterval;
         if(typeof data.recallWindowMs === 'number') state.recallWindowMs = data.recallWindowMs;
         if(typeof data.maxFileBytes === 'number') state.maxFileBytes = data.maxFileBytes;
+        if(typeof data.maxImagePreviewBytes === 'number') state.maxImagePreviewBytes = data.maxImagePreviewBytes;
         state.limit = data.limit;
         state.cursor=data.cursor;
         state.online=data.online;
@@ -2216,7 +2428,12 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         state.onlineByChannel=data.onlineByChannel;
         state.users=data.users||[];
         state.typing=data.typing||[];
+        const previousPrivateUnread=state.previousPrivateUnread;
         state.privateUnread=data.privateUnread||{};
+        state.previousPrivateUnread={...state.privateUnread};
+        const previousChannelUnread=state.previousChannelUnread;
+        state.channelUnread=data.channelUnread||{};
+        state.previousChannelUnread={...state.channelUnread};
         state.privateActivity=data.privateActivity||{};
         if(state.mode==='private'&&data.peer) state.peer=data.peer;
         if(typeof data.retentionMs==='number') state.retentionMs=data.retentionMs;
@@ -2228,20 +2445,27 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         const atBottom = wasLocked || Math.abs((root.scrollTop + root.clientHeight) - root.scrollHeight) < 6;
         const indexById = new Map(state.messages.map((message,index)=>[message.id,index]));
         const newIds = [];
+        const newMessages = [];
         const merged = state.messages.slice();
         let hasUpdates=false;
         data.messages.forEach(m=>{
           if(Date.now()-m.at>=data.retentionMs) return;
           const existingIndex=indexById.get(m.id);
-          if(existingIndex===undefined) { indexById.set(m.id,merged.length); merged.push(m); newIds.push(m.id); return; }
+          if(existingIndex===undefined) { indexById.set(m.id,merged.length); merged.push(m); newIds.push(m.id); newMessages.push(m); return; }
           if((m.cursor||0)>(merged[existingIndex].cursor||0)) {
-            if(m.recalled) releaseDirectFile(merged[existingIndex]);
+            if(m.recalled) { if(state.previewingMessageId===m.id) closeImagePreview(); releaseDirectFile(merged[existingIndex]); }
             merged[existingIndex]=m; hasUpdates=true;
-            const oldNode=vlist.nodeMap.get(m.id); if(oldNode) oldNode.remove(); vlist.nodeMap.delete(m.id);
+            const oldNode=vlist.nodeMap.get(m.id); if(oldNode) oldNode.remove(); vlist.nodeMap.delete(m.id); vlist.heights.delete(m.id);
           }
         });
         const wasTrimmed=merged.length>state.renderBatch*2;
         state.messages = wasTrimmed ? merged.slice(-state.renderBatch * 2) : merged;
+        if(state.previewingMessageId&&!state.messages.some(message=>message.id===state.previewingMessageId)) closeImagePreview();
+        const suppressIncoming=state.suppressIncomingOnce;
+        state.suppressIncomingOnce=false;
+        handleIncomingMessages(newMessages,suppressIncoming);
+        handlePrivateUnreadIncreases(previousPrivateUnread,state.privateUnread,suppressIncoming);
+        handleChannelUnreadIncreases(previousChannelUnread,state.channelUnread,suppressIncoming);
         state.scrollLocked = atBottom || newIds.length > 0;
         $('connection').textContent='已连接';
         $('refresh').textContent='刚刚同步';
@@ -2269,20 +2493,21 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         render();
       });
     },{passive:true});
-    $('my-name').addEventListener('input', e => {
+    $('my-name').addEventListener('input',e=>{
       state.nameEdited=true;
       identity.name=Array.from(e.target.value).slice(0,5).join('');
-      e.target.value=identity.name;
-      setAvatarInitial($('my-avatar'),identity.name);
+      setAvatarInitial($('my-avatar'),identity.name||'匿名访客');
       saveLocalName(identity.name);
     });
     $('mobile-users-toggle').addEventListener('click',()=>setMobileUsersOpen(true));
     $('mobile-users-close').addEventListener('click',()=>setMobileUsersOpen(false));
     document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&document.body.classList.contains('mobile-users-open')) setMobileUsersOpen(false); });
-    window.addEventListener('resize',()=>{ if(window.innerWidth>700) setMobileUsersOpen(false); });
+    window.addEventListener('resize',()=>{ if(window.innerWidth>700) setMobileUsersOpen(false); else placeIdentityForViewport(); });
     $('emoji-toggle').addEventListener('click',()=>{ const panel=$('emoji-panel'); panel.hidden=!panel.hidden; $('emoji-toggle').setAttribute('aria-expanded',panel.hidden?'false':'true'); });
     document.addEventListener('click',event=>{ if(!event.target.closest('.emoji-wrap')) { $('emoji-panel').hidden=true; $('emoji-toggle').setAttribute('aria-expanded','false'); } });
     document.addEventListener('keydown',event=>{ if(event.key==='Escape') { $('emoji-panel').hidden=true; $('emoji-toggle').setAttribute('aria-expanded','false'); } });
+    const reactionRule=document.querySelector('.rules-list li:nth-child(3)');
+    if(reactionRule) reactionRule.textContent='点击昵称可快速 @用户，消息下方支持回复';
     function postRtcSignal(target,signal) { return fetch(apiBase+'/api/rtc/signal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:identity.id,target,signal})}).catch(()=>{}); }
     function setupRtcDataChannel(record,channel) {
       record.channel=channel; channel.binaryType='arraybuffer'; channel.bufferedAmountLowThreshold=256*1024;
@@ -2368,9 +2593,9 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       }
       return Array.from(hash,value=>value.toString(16).padStart(8,'0')).join('');
     }
-    async function tryDirectFile(file,peerId,channelId) {
+    async function tryDirectFile(file,peerId,channelId,replyTo='') {
       if(!('RTCPeerConnection' in window)||file.size>RTC_DIRECT_MAX_BYTES) return false;
-      const task={file,requestedMode:'private',peerId,channelId,uploadId:'',transferId:'',paused:false,cancelled:false,pauseAbort:false,resume:null,controller:null,startedAt:performance.now(),startedReceived:0,received:0,pausedMs:0,direct:true};
+      const task={file,requestedMode:'private',peerId,channelId,replyTo,uploadId:'',transferId:'',paused:false,cancelled:false,pauseAbort:false,resume:null,controller:null,startedAt:performance.now(),startedReceived:0,received:0,pausedMs:0,direct:true};
       state.uploadTask=task; state.uploading=true; resetTransferControls(); updateComposerControls(); renderTransferTask(task,0,'正在建立点对点连接');
       try {
         const channel=await ensureRtcChannel(peerId); if(task.cancelled) throw Error('cancelled');
@@ -2387,15 +2612,18 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         channel.send(JSON.stringify({kind:'file-done',transferId})); renderTransferTask(task,file.size,'等待对方校验文件'); await acknowledgement;
         let response; let data={};
         for(let attempt=0;attempt<3;attempt++) {
-          response=await fetch(apiBase+'/api/direct-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:identity.id,peer:peerId,transferId,name:encodeURIComponent(file.name),size:file.size,type:file.type||'application/octet-stream',sha256})});
+          response=await fetch(apiBase+'/api/direct-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:identity.id,peer:peerId,transferId,name:encodeURIComponent(file.name),size:file.size,type:file.type||'application/octet-stream',sha256,replyTo})});
           data=await response.json().catch(()=>({})); if(response.ok) break; await wait(300*(attempt+1));
         }
         if(!response?.ok) throw Error(data.error||'direct metadata failed');
+        const previousDirectFile=directFiles.get(transferId); if(previousDirectFile) URL.revokeObjectURL(previousDirectFile.url);
+        directFiles.set(transferId,{url:URL.createObjectURL(file),name:file.name,size:file.size});
         if(state.mode==='private'&&state.peer?.id===peerId&&!state.messages.some(message=>message.id===data.message?.id)) { state.messages.push(data.message); state.scrollLocked=true; render({newIds:[data.message.id],scrollToBottom:true}); }
         renderTransferTask(task,file.size,'点对点直传完成 · SHA-256 已校验'); $('connection').textContent='文件已点对点发送'; showToast('点对点文件发送成功','success'); return true;
       } catch(error) {
         if(task.transferId) { const waiter=rtcAckWaiters.get(task.transferId); if(waiter) { rtcAckWaiters.delete(task.transferId); waiter.reject(error); } }
         if(error.message==='cancelled') { renderTransferTask(task,task.received||0,'传输已取消'); showToast('已取消文件传输','info'); return true; }
+        if(error.message==='invalid reply') { renderTransferTask(task,task.received||0,'引用消息已失效'); showToast('引用的消息已经失效，请重新发送文件','warning'); return true; }
         renderTransferTask(task,task.received||0,'点对点连接不可用，切换服务器中转'); showToast('点对点连接不可用，已切换服务器分片传输','info'); return false;
       } finally {
         state.uploading=false; if(state.uploadTask===task) state.uploadTask=null; updateComposerControls();
@@ -2443,14 +2671,14 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         } finally { task.controller=null; }
       }
     }
-    async function startChunkUpload(file,requestedMode,peerId,channelId) {
-      const task={file,requestedMode,peerId,channelId,uploadId:'',paused:false,cancelled:false,pauseAbort:false,resume:null,controller:null,startedAt:performance.now(),startedReceived:0,pausedMs:0};
+    async function startChunkUpload(file,requestedMode,peerId,channelId,replyTo='') {
+      const task={file,requestedMode,peerId,channelId,replyTo,uploadId:'',paused:false,cancelled:false,pauseAbort:false,resume:null,controller:null,startedAt:performance.now(),startedReceived:0,pausedMs:0};
       state.uploadTask=task; state.uploading=true; resetTransferControls(); updateComposerControls(); renderTransferTask(task,0,'正在建立安全上传会话');
       $('connection').textContent='正在发送 '+file.name;
       let completed=false;
       try {
-        const fingerprint=[file.name,file.size,file.lastModified,requestedMode,peerId||channelId].join(':');
-        const response=await fetch(apiBase+'/api/upload/init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:identity.id,peer:peerId,channel:channelId,name:encodeURIComponent(file.name),size:file.size,type:file.type||'application/octet-stream',fingerprint})});
+        const fingerprint=[file.name,file.size,file.lastModified,requestedMode,peerId||channelId,replyTo].join(':');
+        const response=await fetch(apiBase+'/api/upload/init',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client:identity.id,peer:peerId,channel:channelId,name:encodeURIComponent(file.name),size:file.size,type:file.type||'application/octet-stream',fingerprint,replyTo})});
         const init=await response.json().catch(()=>({}));
         if(response.status===429) { state.sendCooldownUntil=Date.now()+(init.retryAfter||5000); throw Error('rate limit'); }
         if(!response.ok) { if(init.limit) { state.maxFileBytes=init.limit; syncLimitUI(); } throw Error(init.error||'upload init failed'); }
@@ -2475,6 +2703,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
         if(error.message==='cancelled') { renderTransferTask(task,0,'上传已取消'); $('connection').textContent='上传已取消'; showToast('已取消文件上传','info'); }
         else if(error.message==='peer offline') { if(state.peer?.id===peerId) state.peer.online=false; renderTransferTask(task,0,'对方已离线'); showToast('对方已离线，文件未发送','warning'); renderChannels(); }
         else if(error.message==='channel changed') { renderTransferTask(task,0,'频道已切换'); showToast('频道已经切换，请重新选择文件','warning'); }
+        else if(error.message==='invalid reply') { renderTransferTask(task,0,'引用消息已失效'); showToast('引用的消息已经失效，请重新发送文件','warning'); }
         else if(error.message==='file too large') showToast('文件不能超过 '+formatFileSize(state.maxFileBytes),'warning');
         else if(error.message==='rate limit') showToast('发送太快，每 5 秒只能发送 2 条内容','warning');
         else { renderTransferTask(task,0,'上传中断，重新选择同一文件可续传'); showToast('上传中断，24 小时内重新选择同一文件可继续','error'); }
@@ -2502,18 +2731,32 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       if(state.mode==='private'&&state.peer.online===false) { $('connection').textContent='对方已离线'; showToast('对方已离线，暂时不能发送文件','warning'); return; }
       $('file-input').click();
     });
-    $('file-input').addEventListener('change',async e=>{
-      const file=e.target.files?.[0];
+    async function handleSelectedFile(file) {
       if(!file) return;
+      if(state.full||Date.now()<state.sendCooldownUntil) { showToast('当前暂时不能发送文件','warning'); return; }
+      if(state.uploading) { showToast('请等待当前文件传输结束','warning'); return; }
       const requestedMode=state.mode;
       const peerId=requestedMode==='private'?(state.peer?.id||''):'';
       const channelId=state.channel;
-      if(requestedMode==='private'&&!peerId) { e.target.value=''; showToast('当前私聊会话不可用','warning'); return; }
-      if(file.size<=0||file.size>state.maxFileBytes) { e.target.value=''; const tip=file.size<=0?'不能发送空文件':'文件不能超过 '+formatFileSize(state.maxFileBytes); $('connection').textContent=tip; showToast(tip,'warning'); return; }
-      e.target.value='';
-      if(requestedMode==='private') { const directResult=await tryDirectFile(file,peerId,channelId); if(directResult) return; }
-      await startChunkUpload(file,requestedMode,peerId,channelId);
+      if(requestedMode==='private'&&(!peerId||state.peer?.online===false)) { showToast('对方已离线，暂时不能发送文件','warning'); return; }
+      if(file.size<=0||file.size>state.maxFileBytes) { const tip=file.size<=0?'不能发送空文件':'文件不能超过 '+formatFileSize(state.maxFileBytes); $('connection').textContent=tip; showToast(tip,'warning'); return; }
+      const replyTo=state.replyingTo?.id||'';
+      if(replyTo) clearReply();
+      if(requestedMode==='private') { const directResult=await tryDirectFile(file,peerId,channelId,replyTo); if(directResult) return; }
+      await startChunkUpload(file,requestedMode,peerId,channelId,replyTo);
+    }
+    $('file-input').addEventListener('change',async e=>{
+      const file=e.target.files?.[0]; e.target.value=''; await handleSelectedFile(file);
     });
+    let dragDepth=0; const chatRoot=document.querySelector('.chat');
+    function hasDraggedFiles(event) { return Array.from(event.dataTransfer?.types||[]).includes('Files'); }
+    document.addEventListener('dragover',event=>{ if(hasDraggedFiles(event)) event.preventDefault(); });
+    document.addEventListener('drop',event=>{ if(hasDraggedFiles(event)) event.preventDefault(); });
+    chatRoot.addEventListener('dragenter',event=>{ if(!hasDraggedFiles(event)) return; event.preventDefault(); dragDepth++; chatRoot.classList.add('file-dragging'); });
+    chatRoot.addEventListener('dragleave',event=>{ if(!hasDraggedFiles(event)) return; dragDepth=Math.max(0,dragDepth-1); if(!dragDepth) chatRoot.classList.remove('file-dragging'); });
+    chatRoot.addEventListener('drop',async event=>{ if(!hasDraggedFiles(event)) return; event.preventDefault(); dragDepth=0; chatRoot.classList.remove('file-dragging'); const files=event.dataTransfer?.files; if(files?.length>1) showToast('当前一次只能发送一个文件，将发送第一个','info'); await handleSelectedFile(files?.[0]); });
+    $('message').addEventListener('paste',async event=>{ const files=event.clipboardData?.files; if(!files?.length) return; event.preventDefault(); if(files.length>1) showToast('当前一次只能发送一个文件，将发送第一个','info'); await handleSelectedFile(files[0]); });
+    $('reply-cancel').addEventListener('click',clearReply);
     let typingTimer=0; let lastTypingSentAt=0;
     function sendTypingState(active) {
       const now=Date.now();
@@ -2538,7 +2781,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       $('send').disabled=true;
       let cooldown=0;
       try {
-        const response=await fetch(apiBase+'/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...identity,mode:state.mode,peer:state.peer?.id||'',channel:state.channel,text})});
+        const response=await fetch(apiBase+'/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...identity,mode:state.mode,peer:state.peer?.id||'',channel:state.channel,text,replyTo:state.replyingTo?.id||''})});
         const data=await response.json().catch(()=>({}));
         if(response.status===429 && data.error==='rate limit') {
           cooldown=data.retryAfter||5000;
@@ -2559,6 +2802,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
           saveLocalName(identity.name);
         }
         input.value='';
+        clearReply();
         state.scrollLocked = true;
       } catch(err) {
         if(err.message==='peer offline') {
@@ -2566,7 +2810,8 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
           renderChannels();
           $('connection').textContent='对方已离线';
           showToast('对方已离线，消息未发送','warning');
-        } else if(err.message!=='full'&&err.message!=='rate limit') { $('connection').textContent='发送失败，请重试'; showToast('发送失败，请重试','error'); }
+        } else if(err.message==='invalid reply') { clearReply(); showToast('引用的消息已经失效，请重新选择','warning'); }
+        else if(err.message!=='full'&&err.message!=='rate limit') { $('connection').textContent='发送失败，请重试'; showToast('发送失败，请重试','error'); }
       } finally {
         updateComposerControls();
         input.focus();
@@ -2577,6 +2822,7 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
       state.limit = data.limit || state.limit;
       if(typeof data.retentionMs==='number') state.retentionMs=data.retentionMs;
       if(typeof data.maxFileBytes==='number') state.maxFileBytes=data.maxFileBytes;
+      if(typeof data.maxImagePreviewBytes==='number') state.maxImagePreviewBytes=data.maxImagePreviewBytes;
       syncLimitUI();
       updateComposerControls();
       if(state.canAdmin) {
@@ -2614,6 +2860,10 @@ body.mobile-users-open .profile-panel .mobile-users-close{display:grid!important
     });
     document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.close).hidden=true));
     document.querySelectorAll('.modal-backdrop').forEach(backdrop=>backdrop.addEventListener('click',event=>{ if(event.target===backdrop) backdrop.hidden=true; }));
+    $('image-preview-close').addEventListener('click',closeImagePreview);
+    $('image-preview-modal').addEventListener('click',event=>{ if(event.target===$('image-preview-modal')) closeImagePreview(); });
+    $('image-preview-image').addEventListener('error',()=>{ if(state.previewingMessageId) { closeImagePreview(); showToast('图片预览已失效','warning'); } });
+    document.addEventListener('keydown',event=>{ if(event.key==='Escape'&&!$('image-preview-modal').hidden) closeImagePreview(); });
     $('mobile-channel-select').addEventListener('change',e=>switchChannel(e.target.value));
     $('user-search').addEventListener('input',renderUsers);
     $('admin-ban-button').addEventListener('click',()=>setIpBan($('admin-ban-ip').value.trim(),true));
